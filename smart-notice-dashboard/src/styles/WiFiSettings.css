@@ -1,0 +1,140 @@
+.wifi-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.92fr);
+  align-items: stretch;
+  gap: 22px;
+}
+
+.config-card,
+.connection-card {
+  padding: 26px;
+}
+
+.config-card form > .primary-button {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.device-address-form {
+  margin-bottom: 24px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #edf0f5;
+}
+
+.device-address-form .outline-button {
+  width: 100%;
+}
+
+.password-field {
+  position: relative;
+}
+
+.password-field input {
+  padding-right: 68px;
+}
+
+.password-toggle {
+  position: absolute;
+  top: 0;
+  right: 3px;
+  height: 43px;
+  padding: 0 11px;
+  border: 0;
+  background: transparent;
+  color: #315b9d;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.password-toggle:hover {
+  color: #163d7b;
+}
+
+.connection-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin: -4px 0 19px;
+}
+
+.connection-summary .header-status {
+  margin: 0;
+  border-color: #e6ebf2;
+  background: #f8fafc;
+  color: #384b68;
+}
+
+.poll-note {
+  color: #8a97a9;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.device-details {
+  margin: 0;
+  border-top: 1px solid #edf0f5;
+}
+
+.device-details > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 15px 0;
+  border-bottom: 1px solid #edf0f5;
+}
+
+.device-details dt {
+  color: #78869a;
+  font-size: 12px;
+}
+
+.device-details dd {
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: #253957;
+  font-size: 12px;
+  font-weight: 650;
+  text-align: right;
+}
+
+.action-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+@media (max-width: 800px) {
+  .wifi-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  .config-card,
+  .connection-card {
+    padding: 20px;
+  }
+
+  .connection-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .device-details > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .device-details dd {
+    text-align: left;
+  }
+
+  .action-row {
+    grid-template-columns: 1fr;
+  }
+}
