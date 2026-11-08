@@ -3,13 +3,21 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import RemoteWiFiConfiguration from "./RemoteWiFiConfiguration.jsx";
 import {
+  getFirmwareUpdate,
   getRemoteWifiConfiguration,
+  getRemoteWifiForget,
   startRemoteWifiConfiguration,
+  startFirmwareUpdate,
+  startRemoteWifiForget,
 } from "../services/esp32Service.js";
 
 vi.mock("../services/esp32Service.js", () => ({
+  getFirmwareUpdate: vi.fn(),
   getRemoteWifiConfiguration: vi.fn(),
+  getRemoteWifiForget: vi.fn(),
   startRemoteWifiConfiguration: vi.fn(),
+  startFirmwareUpdate: vi.fn(),
+  startRemoteWifiForget: vi.fn(),
 }));
 
 describe("remote ESP32 Wi-Fi configuration", () => {
@@ -112,5 +120,97 @@ describe("remote ESP32 Wi-Fi configuration", () => {
       await screen.findByRole("alert", {}, { timeout: 3000 }),
     ).toHaveTextContent("The ESP32 could not connect to that Wi-Fi network.");
     expect(screen.getByLabelText("Wi-Fi password")).toHaveValue("");
+  });
+
+  it("requires confirmation and reports successful Wi-Fi credential deletion", async () => {
+    const user = userEvent.setup();
+    const onConfigured = vi.fn().mockResolvedValue(undefined);
+    startRemoteWifiForget.mockResolvedValue({
+      requestId: "forget-123",
+      state: "command_sent",
+    });
+    getRemoteWifiForget.mockResolvedValue({
+      requestId: "forget-123",
+      state: "deleted",
+    });
+
+    render(
+      <RemoteWiFiConfiguration
+        deviceConnected
+        onConfigured={onConfigured}
+        sessionToken="session-token"
+        wifiStatus={{
+          connected: true,
+          rssi: -61,
+          firmwareVersion: "1.0.0",
+        }}
+      />,
+    );
+
+    expect(screen.getByText("-61 dBm")).toBeInTheDocument();
+    expect(screen.getByText("1.0.0")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Forget saved Wi-Fi" }));
+    expect(
+      screen.getByText(/permanently deletes saved Wi-Fi credentials/i),
+    ).toBeInTheDocument();
+    expect(startRemoteWifiForget).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("button", { name: "Confirm deletion" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Forget saved Wi-Fi" }));
+    await user.click(screen.getByRole("button", { name: "Confirm deletion" }));
+    expect(
+      await screen.findByText(
+        /Saved Wi-Fi credentials were deleted/,
+        {},
+        { timeout: 3000 },
+      ),
+    ).toBeInTheDocument();
+    expect(startRemoteWifiForget).toHaveBeenCalledWith("session-token");
+    expect(getRemoteWifiForget).toHaveBeenCalledWith(
+      "session-token",
+      "forget-123",
+    );
+    expect(onConfigured).toHaveBeenCalledOnce();
+  });
+
+  it("reports OTA success only after the ESP32 reconnects with the new version", async () => {
+    const user = userEvent.setup();
+    const onConfigured = vi.fn().mockResolvedValue(undefined);
+    startFirmwareUpdate.mockResolvedValue({
+      requestId: "firmware-123",
+      state: "command_sent",
+    });
+    getFirmwareUpdate.mockResolvedValue({
+      requestId: "firmware-123",
+      state: "verified",
+      version: "1.0.1",
+    });
+
+    render(
+      <RemoteWiFiConfiguration
+        deviceConnected
+        onConfigured={onConfigured}
+        sessionToken="session-token"
+        wifiStatus={{ connected: true, firmwareVersion: "1.0.0" }}
+      />,
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Check for signed update" }),
+    );
+    expect(
+      await screen.findByText(
+        /reconnected with the updated firmware/,
+        {},
+        { timeout: 3000 },
+      ),
+    ).toBeInTheDocument();
+    expect(startFirmwareUpdate).toHaveBeenCalledWith("session-token");
+    expect(getFirmwareUpdate).toHaveBeenCalledWith(
+      "session-token",
+      "firmware-123",
+    );
+    expect(onConfigured).toHaveBeenCalledOnce();
   });
 });

@@ -4,17 +4,21 @@ import {
   createDashboardSession,
   discoverESP32,
   disconnectWiFi,
+  getFirmwareUpdate,
   getBackendHealth,
   getDeviceStatus,
   getESP32Address,
   getRemoteWifiConfiguration,
+  getRemoteWifiForget,
   getStatus,
   logoutDashboardSession,
   normalizeESP32Address,
   reconnectWiFi,
   sendNotice,
   setESP32Address,
+  startFirmwareUpdate,
   startRemoteWifiConfiguration,
+  startRemoteWifiForget,
 } from "./esp32Service.js";
 
 const ACCESS_POINT = "http://192.168.4.1";
@@ -336,6 +340,110 @@ describe("status and notice API", () => {
     await expect(
       getRemoteWifiConfiguration("session-token", "request-123"),
     ).rejects.toThrow(/invalid Wi-Fi operation status/);
+  });
+
+  it("starts credential deletion without sending a password", async () => {
+    const response = {
+      success: true,
+      requestId: "forget-123",
+      state: "command_sent",
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(response, 202));
+
+    await expect(startRemoteWifiForget("session-token")).resolves.toEqual(response);
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/device/wifi-forget`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: expect.any(String),
+        }),
+      }),
+    );
+    expect(fetch.mock.calls[0][1]).not.toHaveProperty("body");
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
+  });
+
+  it("polls a Wi-Fi credential deletion operation", async () => {
+    const response = {
+      success: true,
+      operation: {
+        requestId: "forget-123",
+        state: "deleted",
+        message: "Credentials deleted",
+      },
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(response));
+
+    await expect(
+      getRemoteWifiForget("session-token", "forget-123"),
+    ).resolves.toEqual(response.operation);
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/device/wifi-forget/forget-123`,
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          Authorization: expect.any(String),
+        }),
+      }),
+    );
+  });
+
+  it("starts a firmware update request through the authenticated backend", async () => {
+    const response = {
+      success: true,
+      requestId: "firmware-123",
+      state: "command_sent",
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(response, 202));
+
+    await expect(startFirmwareUpdate("session-token")).resolves.toEqual(response);
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/device/firmware-update`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: expect.any(String),
+        }),
+      }),
+    );
+    expect(fetch.mock.calls[0][1]).not.toHaveProperty("body");
+  });
+
+  it("polls a firmware update and validates the operation state", async () => {
+    const response = {
+      success: true,
+      operation: {
+        requestId: "firmware-123",
+        state: "verified",
+        version: "1.0.1",
+      },
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(response));
+
+    await expect(
+      getFirmwareUpdate("session-token", "firmware-123"),
+    ).resolves.toEqual(response.operation);
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/device/firmware-update/firmware-123`,
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          Authorization: expect.any(String),
+        }),
+      }),
+    );
+
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        success: true,
+        operation: { requestId: "firmware-123", state: "untrusted" },
+      }),
+    );
+    await expect(
+      getFirmwareUpdate("session-token", "firmware-123"),
+    ).rejects.toThrow(/invalid firmware update status/);
   });
 
   it("exchanges the access code for a backend session", async () => {

@@ -2,9 +2,9 @@
 
 **Automated check date:** 2026-11-08  
 **Firmware target:** PlatformIO `esp32dev`, ESP32 Arduino framework  
-**Scope:** Frontend tests/build/lint, backend API and WebSocket integration tests,
-firmware compilation, and code review after remote Wi-Fi configuration and
-delivery-acknowledgment changes.
+**Scope:** Frontend tests/build/lint, backend API/WebSocket/security tests,
+firmware compilation, signed-OTA implementation, partition-table validation,
+and Git/configuration checks.
 
 The hardware results below are the results supplied by the project owner. They
 were not rerun after these changes because no ESP32, LCD, or project Wi-Fi
@@ -34,22 +34,31 @@ provided and the behavior still needs physical verification.
 | 19 | Router shutdown and recovery | The board detects loss and retries saved credentials when the router returns. | Owner reported automatic Wi-Fi recovery passed. | PASS (owner-reported baseline) | Post-change recovery timing has not been measured. | Retest after flashing; observe status through outage and recovery. |
 | 20 | Dashboard-to-device notice delivery | Dashboard sends notice through authenticated HTTPS API; success waits for an ESP32 WebSocket acknowledgment. | Backend integration test passes with a simulated authenticated device. No physical LCD test was run. | PASS (simulated backend) / NOT TESTED (hardware) | Firmware acknowledges after running the LCD display routine; physical LCD output cannot be sensed remotely. | Flash firmware and confirm notice/acknowledgment behavior on the board and LCD. |
 | 21 | Remote Wi-Fi configuration | Authenticated dashboard credentials reach the ESP32; result is confirmed only after backend reconnection, with prior credentials retained on failure. | Dashboard service/UI tests and backend simulated-device tests pass; firmware compiles. No physical Wi-Fi test was run. | PASS (automated) / NOT TESTED (hardware) | Backend operation state is in memory and requires a single backend instance. ESP32 Preferences/NVS credentials are not application-encrypted. | Flash firmware; test success, wrong password, backend loss, rollback, and recovery AP behavior on the board. |
+| 22 | Forget saved Wi-Fi | Explicit confirmation clears NVS credentials, reports the result, and keeps the recovery AP available. | Dashboard, backend operation-state tests, and firmware compilation pass. No board test was run. | PASS (automated) / NOT TESTED (hardware) | Backend tests simulate accepted, deleted, failed, and timed-out responses. | Verify actual NVS deletion, station disconnect, and recovery AP access. |
+| 23 | Signed OTA | Device installs only a signed, newer image over verified HTTPS and confirms its version after reboot. | Firmware compiles; signer-size, canonical-payload, and valid/invalid Ed25519-vector tests pass. No release or hardware OTA test is available. | PASS (implementation/build) / NOT TESTED (runtime) | OTA remains disabled because the owner-provided public key is empty. | Configure the owner public key, publish a signed test release, then complete the physical OTA checklist. |
+| 24 | TLS trust anchors | WSS and OTA HTTPS use trusted CA validation and reject invalid certificates. | Certificate-verified live TLS handshakes succeeded for the Render host, GitHub, and the release-assets host using the embedded roots. Installed WebSockets 2.7.3 calls `setCACert`; HTTPClient redirects remain HTTPS and use the CA-configured client. | PASS (live host TLS/source/build) / NOT TESTED (hardware) | CA roots are trust anchors, not certificate pins; a physical ESP32 handshake was not run. | Verify backend WSS and GitHub release downloads on the physical device. |
 
 ## Automated checks run
 
 | Check | Result | Notes |
 |---|---|---|
-| PlatformIO firmware build | PASS | `C:\Users\bharg\.platformio\penv\Scripts\pio.exe run`; ESP32 framework 3.3.12. Firmware was compiled, not flashed. Flash usage is 98.4% of the configured application partition; remaining headroom is limited. |
+| PlatformIO firmware build | PASS | `C:\Users\bharg\.platformio\penv\Scripts\pio.exe run`; ESP32 framework 3.3.12. Firmware was compiled, not flashed. ELF flash usage is 1,322,713 / 1,507,328 bytes (87.8%); the generated binary is 1,354,512 bytes, leaving 152,816 bytes (10.1%) in the OTA slot. |
 | PlatformIO dependencies | PASS | Resolved `LiquidCrystal 1.0.7`, `ArduinoJson 7.4.3`, `WebSockets 2.7.3`, `Preferences`, `WebServer`, and `WiFi`. |
 | Dashboard production build | PASS | `npm run build`; Vite 8.3.6. |
 | Dashboard lint | PASS | `npm run lint`; no errors or warnings. |
-| Dashboard tests | PASS | `npm test`; 61 tests passed across 5 files. Includes authenticated remote Wi-Fi request/polling, credential validation, progress/success/failure UI, password clearing, sign-in-gated navigation, and existing session, notice, and local provisioning behavior. |
-| Backend integration tests | PASS | `npm test`; 14 tests passed, including authenticated Wi-Fi configuration, invalid credentials, duplicate operations, request IDs, reconnect success, timeout, and password omission from operation results, plus the existing authentication, status, and notice scenarios. Uses a simulated WebSocket device. |
-| Deployed Render health check | PASS | Unauthenticated `GET /api/health` returned `status: OK` and `websocketConnected: true` at test time. Authenticated production routes were not called. |
-| Local configured access-code smoke check | PASS | Using the ignored backend `.env`, login returned HTTP 200, authenticated device status returned 200, logout returned 200, and the revoked session then received 401. The configured code was not printed. |
-| Firmware logic unit tests | NOT AVAILABLE | The project has no host-side firmware unit-test harness. Scroll boundaries and Wi-Fi transitions still need board-level verification. |
-| Browser/device integration check | NOT TESTED | No physical ESP32, LCD, or project Wi-Fi network was accessible. Backend integration used a simulated WebSocket device; no live board/LCD delivery was performed. |
-| Dependency audit | PASS WITH FINDINGS | `npm audit` reported 4 moderate dashboard advisories and 2 moderate backend advisories; no high or critical findings. npm reports fixes only through major-version changes/downgrades. Dependencies were not changed. |
+| Dashboard tests | PASS | `npm test`; 67 tests passed across 5 files, including Wi-Fi forget and OTA service/UI behavior. |
+| Backend integration tests | PASS | `npm test`; 18 tests passed, including login throttling, credential deletion states, firmware operation transitions, post-reboot version verification, notice acknowledgment, and Wi-Fi configuration. Uses a simulated WebSocket device. |
+| OTA signer and AP-password tests | PASS | `python -m unittest discover -s tests -v`; 14 tests passed, including oversize rejection, exact-size acceptance, canonical-message parity, safe output/key paths, a public RFC Ed25519 valid/invalid vector, and production-upload gate behavior. No signing key was generated or used. |
+| TLS certificate validation | PASS | A Python SSL context containing only `include/trust_roots.h` roots verified live TLS handshakes to `smart-notice-board-api.onrender.com`, `github.com`, and `release-assets.githubusercontent.com`. |
+| PlatformIO production-upload gate | PASS (policy) | The extra script blocks upload targets unless ignored `include/secrets.h` has one custom, non-default 8–63 byte `BOARD_AP_PASSWORD`. Policy tests passed; no upload command was run. |
+| Backend env variable names | PASS | Local ignored `.env` and `.env.example` variable names match. Values were not printed. |
+| Partition layout | PASS | The custom table was decoded with Espressif's generator; all partition boundaries fit the 4 MiB flash. |
+| Git secret/artifact audit | PASS | No real `.env`, `secrets.h`, signing private key, release artifact, or firmware build output is tracked. Local `.env` and `include/secrets.h` remain ignored. |
+| `git diff --check` | PASS | No whitespace errors. |
+| Render health and local credential smoke check | NOT RERUN | This change made no Render request or setting change. Historical results are not treated as current deployment verification. |
+| Firmware logic unit tests | NOT AVAILABLE | The project has no host-side firmware unit-test harness. Wi-Fi transitions and cryptographic OTA behavior need hardware/release-level verification. |
+| Browser/device integration check | NOT TESTED | No physical ESP32, LCD, or project Wi-Fi network was accessible. Backend integration used a simulated WebSocket device. |
+| Dependency audit | 6 MODERATE ADVISORIES | Fresh `npm audit`: backend 2 moderate, dashboard 4 moderate; no high/critical advisories. npm proposes `--force` dependency changes that downgrade/replace major versions, so dependencies and lockfiles were left unchanged. |
 
 ## Findings and retest notes
 
@@ -58,9 +67,12 @@ provided and the behavior still needs physical verification.
   manually configured override, and the last station IP reported by the ESP32.
   A successful `/status` response refreshes the station IP in session storage.
 - Provisioning requires the user to connect their phone/computer to
-  `SmartNoticeBoard` (password `12345678`), open the dashboard over HTTP, submit
-  router credentials, then manually return to the router Wi-Fi after the board
-  reports its DHCP IP. A browser cannot switch its own network connection.
+  `SmartNoticeBoard` (configured `BOARD_AP_PASSWORD`, or the legacy fallback
+  `12345678` in a development build with a serial warning), open the dashboard
+  over HTTP, submit router credentials, then manually return to the router
+  Wi-Fi after the board reports its DHCP IP. PlatformIO refuses firmware
+  uploads without a custom, non-default password. A browser cannot switch its
+  own network connection.
 - If the router uses guest-network isolation, client-isolation settings, or
   otherwise blocks device-to-device traffic, the dashboard cannot reach the
   station IP. Keep the setup AP reachable for provisioning or use a VPN/secure
@@ -111,6 +123,9 @@ provided and the behavior still needs physical verification.
   confirmed on the physical display after the changes.
 - No claim of physical LCD, Wi-Fi, or ESP32 integration success is made for the
   revised firmware until the owner runs the hardware tests above.
+- OTA is compiled but disabled until the owner configures the public key in
+  `include/ota_config.h`; the matching private key must remain offline and
+  outside the repository. No OTA release was created or installed.
 
 ## Run and upload commands
 

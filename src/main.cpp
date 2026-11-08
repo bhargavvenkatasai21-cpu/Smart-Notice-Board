@@ -2,27 +2,43 @@
 #include <ArduinoJson.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
 #include <LiquidCrystal.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include "secrets.h"
+#include "ota_config.h"
+#include "trust_roots.h"
+#include "firmware_update.h"
 
 namespace
 {
     constexpr char kApName[] = "SmartNoticeBoard";
-    constexpr char kApPassword[] = "12345678";
+#ifndef BOARD_AP_PASSWORD
+#define BOARD_AP_PASSWORD "12345678"
+    constexpr bool kUsingDefaultApPassword = true;
+#else
+    constexpr bool kUsingDefaultApPassword = false;
+#endif
+    constexpr char kApPassword[] = BOARD_AP_PASSWORD;
     constexpr char kPreferencesNamespace[] = "wifi";
+    constexpr char kFirmwareVersion[] = "1.0.0";
 
     constexpr char kBackendHost[] = "smart-notice-board-api.onrender.com";
     constexpr uint16_t kBackendPort = 443;
     constexpr char kBackendPath[] = "/ws";
 
-    constexpr unsigned long kReconnectIntervalMs = 10000;
+    constexpr unsigned long kReconnectInitialDelayMs = 10000;
+    constexpr unsigned long kReconnectMaximumDelayMs = 300000;
     constexpr unsigned long kConnectionTimeoutMs = 30000;
     constexpr unsigned long kInitialFrameHoldMs = 5000;
     constexpr unsigned long kScrollIntervalMs = 350;
+    constexpr unsigned long kDeviceStatusIntervalMs = 30000;
+    constexpr unsigned long kForgetDisconnectDelayMs = 250;
+    constexpr unsigned long kTimeSyncRetryIntervalMs = 30000;
+    constexpr time_t kMinimumValidTime = 1704067200;
 
     constexpr size_t kMaxNoticeLength = 200;
     constexpr size_t kLcdColumns = 16;
@@ -49,6 +65,14 @@ namespace
     bool connectionSawDisconnect = true;
     unsigned long connectionStartedAt = 0;
     unsigned long lastReconnectAttemptAt = 0;
+    unsigned long reconnectDelayMs = kReconnectInitialDelayMs;
+    unsigned long lastDeviceStatusAt = 0;
+    unsigned long lastTimeSyncRequestAt = 0;
+    unsigned long wifiForgetDisconnectStartedAt = 0;
+    bool reconnectBackoffActive = false;
+    bool wifiForgetDisconnectPending = false;
+    bool firmwareUpdateInProgress = false;
+    bool timeSyncRequested = false;
     String connectionTargetSsid;
     String connectionError;
     volatile bool stationGotIpEvent = false;
@@ -66,6 +90,7 @@ namespace
     String remoteWifiPreviousSsid;
     String remoteWifiPreviousPassword;
     String remoteWifiFailureMessage;
+    String firmwareUpdateRequestId;
 
     constexpr unsigned long kBackendReconnectTimeoutMs = 60000;
 
@@ -283,6 +308,182 @@ namespace
         webSocket.sendTXT(message);
     }
 
+    void sendWifiForgetStatus(const String &requestId, const char *state)
+    {
+        if (!webSocketAuthenticated || requestId.isEmpty())
+        {
+            return;
+        }
+
+        JsonDocument document;
+        document["type"] = "WIFI_FORGET_STATUS";
+        document["requestId"] = requestId;
+        document["state"] = state;
+        String message;
+        serializeJson(document, message);
+        webSocket.sendTXT(message);
+    }
+
+    void sendFirmwareUpdateStatus(
+        const String &requestId,
+        const char *state,
+        const String &version = "",
+        const String &messageText = "")
+    {
+        if (!webSocketAuthenticated || requestId.isEmpty())
+        {
+            return;
+        }
+
+        JsonDocument document;
+        document["type"] = "FIRMWARE_UPDATE_STATUS";
+        document["requestId"] = requestId;
+        document["state"] = state;
+        if (!version.isEmpty())
+        {
+            document["version"] = version;
+        }
+        if (!messageText.isEmpty())
+        {
+            document["message"] = messageText;
+        }
+
+        String message;
+        serializeJson(document, message);
+        webSocket.sendTXT(message);
+    }
+
+    void reportFirmwareUpdateStatus(
+        const char *state,
+        const String &version)
+    {
+        sendFirmwareUpdateStatus(firmwareUpdateRequestId, state, version);
+    }
+
+    void handleRemoteFirmwareUpdate(JsonDocument &document)
+    {
+        const char *requestId = document["requestId"];
+        if (!validRequestId(requestId))
+        {
+            return;
+        }
+
+        const String requestIdValue(requestId);
+        if (
+            !webSocketAuthenticated ||
+            firmwareUpdateInProgress ||
+            connectionInProgress ||
+            remoteWifiConfigurationActive ||
+            wifiForgetDisconnectPending)
+        {
+            sendFirmwareUpdateStatus(
+                requestIdValue,
+                "failed",
+                "",
+                "Another device operation is in progress.");
+            return;
+        }
+
+        firmwareUpdateInProgress = true;
+        firmwareUpdateRequestId = requestIdValue;
+        String updatedVersion;
+        String failureMessage;
+        const bool updateStarted = firmware_update::performUpdate(
+            kFirmwareVersion,
+            reportFirmwareUpdateStatus,
+            updatedVersion,
+            failureMessage);
+        if (
+            !updateStarted &&
+            failureMessage !=
+                "The ESP32 already has the latest firmware.")
+        {
+            sendFirmwareUpdateStatus(
+                firmwareUpdateRequestId,
+                "failed",
+                "",
+                failureMessage);
+        }
+        firmwareUpdateInProgress = false;
+        firmwareUpdateRequestId = "";
+    }
+
+    void sendDeviceStatus()
+    {
+        if (!webSocketAuthenticated)
+        {
+            return;
+        }
+
+        const bool connected = connectedToTargetNetwork();
+        JsonDocument document;
+        document["type"] = "DEVICE_STATUS";
+        document["connected"] = connected;
+        document["ssid"] = connected ? WiFi.SSID() : "";
+        document["ip"] = connected ? WiFi.localIP().toString() : "";
+        document["rssi"] = connected ? WiFi.RSSI() : 0;
+        document["firmwareVersion"] = kFirmwareVersion;
+
+        String message;
+        serializeJson(document, message);
+        webSocket.sendTXT(message);
+        lastDeviceStatusAt = millis();
+    }
+
+    void handleRemoteWifiForget(JsonDocument &document)
+    {
+        const char *requestId = document["requestId"];
+        if (!validRequestId(requestId))
+        {
+            return;
+        }
+
+        const String requestIdValue(requestId);
+        if (
+            !webSocketAuthenticated ||
+            connectionInProgress ||
+            remoteWifiConfigurationActive ||
+            wifiForgetDisconnectPending)
+        {
+            sendWifiForgetStatus(requestIdValue, "failed");
+            return;
+        }
+
+        sendWifiForgetStatus(requestIdValue, "accepted");
+
+        if (!preferences.begin(kPreferencesNamespace, false))
+        {
+            sendWifiForgetStatus(requestIdValue, "failed");
+            return;
+        }
+
+        const bool cleared = preferences.clear();
+        const bool verified = cleared &&
+                              !preferences.isKey("activeSlot") &&
+                              !preferences.isKey("ssid0") &&
+                              !preferences.isKey("password0") &&
+                              !preferences.isKey("ssid1") &&
+                              !preferences.isKey("password1") &&
+                              !preferences.isKey("ssid") &&
+                              !preferences.isKey("password");
+        preferences.end();
+
+        if (!verified)
+        {
+            sendWifiForgetStatus(requestIdValue, "failed");
+            return;
+        }
+
+        credentialCandidatePending = false;
+        credentialCandidateSsid = "";
+        credentialCandidatePassword = "";
+        reconnectEnabled = false;
+        WiFi.setAutoReconnect(false);
+        sendWifiForgetStatus(requestIdValue, "deleted");
+        wifiForgetDisconnectPending = true;
+        wifiForgetDisconnectStartedAt = millis();
+    }
+
     void startRemoteWifiRollback(const String &reason)
     {
         remoteWifiConfigurationFailed = true;
@@ -323,7 +524,7 @@ namespace
 
         lcd.clear();
         writeLcd16("Connecting WiFi");
-        Serial.printf("Connecting to WiFi network: %s\n", ssid.c_str());
+        Serial.println("Connecting to WiFi network");
     }
 
     void handleConnect()
@@ -618,19 +819,7 @@ namespace
             {
                 webSocketAuthenticated = true;
                 Serial.println("ESP32 authenticated successfully");
-
-                JsonDocument statusDocument;
-                statusDocument["type"] = "DEVICE_STATUS";
-                statusDocument["connected"] = connectedToTargetNetwork();
-                statusDocument["ssid"] = connectedToTargetNetwork()
-                    ? WiFi.SSID()
-                    : "";
-                statusDocument["ip"] = connectedToTargetNetwork()
-                    ? WiFi.localIP().toString()
-                    : "";
-                String statusMessage;
-                serializeJson(statusDocument, statusMessage);
-                webSocket.sendTXT(statusMessage);
+                sendDeviceStatus();
 
                 if (remoteWifiConfigurationActive)
                 {
@@ -712,6 +901,14 @@ namespace
             {
                 handleRemoteWifiConfiguration(document);
             }
+            else if (strcmp(messageType, "WIFI_FORGET") == 0)
+            {
+                handleRemoteWifiForget(document);
+            }
+            else if (strcmp(messageType, "FIRMWARE_UPDATE") == 0)
+            {
+                handleRemoteFirmwareUpdate(document);
+            }
 
             break;
         }
@@ -741,7 +938,6 @@ namespace
         displayNoticeFrame();
 
         Serial.println("New notice received:");
-        Serial.println(notice);
         Serial.println("LCD notice display started at character 1");
     }
 
@@ -765,6 +961,8 @@ namespace
         document["connecting"] = connectionInProgress;
         document["ip"] = connected ? WiFi.localIP().toString() : "";
         document["ssid"] = connected ? WiFi.SSID() : "";
+        document["rssi"] = connected ? WiFi.RSSI() : 0;
+        document["firmwareVersion"] = kFirmwareVersion;
         document["apIp"] = WiFi.softAPIP().toString();
         document["savedCredentials"] =
             credentialResult == CredentialLoadResult::Loaded;
@@ -835,12 +1033,38 @@ namespace
             Serial.println(WiFi.localIP());
         }
 
+        if (
+            wifiForgetDisconnectPending &&
+            now - wifiForgetDisconnectStartedAt >= kForgetDisconnectDelayMs)
+        {
+            wifiForgetDisconnectPending = false;
+            if (webSocketStarted)
+            {
+                webSocket.disconnect();
+                webSocketStarted = false;
+                webSocketAuthenticated = false;
+            }
+            connectionInProgress = false;
+            WiFi.disconnect(false, false);
+            connectionSawDisconnect = true;
+            connectionError = "";
+            lcd.clear();
+            writeLcd16("Setup Hotspot");
+        }
+
         if (WiFi.status() != WL_CONNECTED)
         {
             connectionSawDisconnect = true;
         }
 
         const bool connected = connectedToTargetNetwork();
+
+        if (
+            webSocketAuthenticated &&
+            now - lastDeviceStatusAt >= kDeviceStatusIntervalMs)
+        {
+            sendDeviceStatus();
+        }
 
         if (connected)
         {
@@ -849,32 +1073,14 @@ namespace
                 connectionError = "";
             }
 
-            // Start secure WebSocket connection to Render
-            if (!webSocketStarted)
-            {
-                webSocket.onEvent(webSocketEvent);
-                webSocket.setReconnectInterval(5000);
-                webSocket.enableHeartbeat(25000, 5000, 2);
-
-                webSocket.beginSSL(
-                    kBackendHost,
-                    kBackendPort,
-                    kBackendPath);
-
-                webSocketStarted = true;
-
-                Serial.println(
-                    "Starting secure WebSocket connection to Render...");
-            }
-
             if (connectionInProgress)
             {
                 connectionInProgress = false;
                 Serial.println("WiFi connected!");
                 Serial.print("ESP32 IP address: ");
                 Serial.println(WiFi.localIP());
-                Serial.print("WiFi SSID: ");
-                Serial.println(WiFi.SSID());
+                reconnectDelayMs = kReconnectInitialDelayMs;
+                reconnectBackoffActive = false;
 
                 if (credentialCandidatePending)
                 {
@@ -909,6 +1115,47 @@ namespace
                 writeLcd16(WiFi.localIP().toString());
             }
 
+            const time_t currentTime = time(nullptr);
+            if (currentTime < kMinimumValidTime)
+            {
+                connectionError =
+                    "Waiting for network time before secure backend connection.";
+                if (
+                    !timeSyncRequested ||
+                    now - lastTimeSyncRequestAt >= kTimeSyncRetryIntervalMs)
+                {
+                    configTime(
+                        0,
+                        0,
+                        "pool.ntp.org",
+                        "time.cloudflare.com");
+                    timeSyncRequested = true;
+                    lastTimeSyncRequestAt = now;
+                    Serial.println("Requesting network time for TLS validation");
+                }
+                return;
+            }
+
+            // Start secure WebSocket connection to Render only after the
+            // system clock is valid for certificate-date verification.
+            if (!webSocketStarted)
+            {
+                webSocket.onEvent(webSocketEvent);
+                webSocket.setReconnectInterval(5000);
+                webSocket.enableHeartbeat(25000, 5000, 2);
+
+                webSocket.beginSslWithCA(
+                    kBackendHost,
+                    kBackendPort,
+                    kBackendPath,
+                    kTrustedCaCertificates);
+
+                webSocketStarted = true;
+
+                Serial.println(
+                    "Starting secure WebSocket connection to Render...");
+            }
+
             if (
                 remoteWifiConfigurationActive &&
                 remoteWifiTargetConnected &&
@@ -927,6 +1174,16 @@ namespace
         {
             connectionInProgress = false;
             lastReconnectAttemptAt = now;
+            if (reconnectBackoffActive)
+            {
+                reconnectDelayMs = min(
+                    reconnectDelayMs * 2,
+                    kReconnectMaximumDelayMs);
+            }
+            else
+            {
+                reconnectBackoffActive = true;
+            }
             connectionError =
                 "WiFi connection timed out. Check the network name, password, and signal.";
             Serial.println("WiFi connection attempt timed out");
@@ -936,6 +1193,13 @@ namespace
             WiFi.setAutoReconnect(reconnectEnabled);
             lcd.clear();
             writeLcd16("WiFi Failed");
+
+            if (!remoteWifiConfigurationActive)
+            {
+                credentialCandidatePending = false;
+                credentialCandidateSsid = "";
+                credentialCandidatePassword = "";
+            }
 
             if (
                 remoteWifiConfigurationActive &&
@@ -948,7 +1212,7 @@ namespace
 
         if (reconnectEnabled &&
             !connectionInProgress &&
-            now - lastReconnectAttemptAt >= kReconnectIntervalMs)
+            now - lastReconnectAttemptAt >= reconnectDelayMs)
         {
             String ssid;
             String password;
@@ -960,6 +1224,7 @@ namespace
                 Serial.println("Retrying saved WiFi connection");
             }
         }
+
     }
 
 } // namespace
@@ -971,6 +1236,11 @@ void setup()
 
     Serial.println();
     Serial.println("Starting Smart Notice Board...");
+    if (kUsingDefaultApPassword)
+    {
+        Serial.println(
+            "WARNING: setup AP uses its default password; set BOARD_AP_PASSWORD in include/secrets.h");
+    }
 
     lcd.begin(16, 2);
     lcd.noAutoscroll();

@@ -16,6 +16,12 @@
 !.env.sample
 include/secrets.h
 
+# Offline firmware-signing material and release artifacts
+*.pem
+*.key
+.signing/
+release-artifacts/
+
 # Logs and temporary files
 *.log
 npm-debug.log*

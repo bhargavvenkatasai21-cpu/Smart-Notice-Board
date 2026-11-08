@@ -1,12 +1,24 @@
 import { useRef, useState } from "react";
 import {
+  getFirmwareUpdate,
   getRemoteWifiConfiguration,
+  getRemoteWifiForget,
   startRemoteWifiConfiguration,
+  startFirmwareUpdate,
+  startRemoteWifiForget,
 } from "../services/esp32Service.js";
 
 const TERMINAL_STATES = new Set(["authenticated", "failed", "timed_out"]);
+const FORGET_TERMINAL_STATES = new Set(["deleted", "failed", "timed_out"]);
+const FIRMWARE_TERMINAL_STATES = new Set([
+  "verified",
+  "up_to_date",
+  "failed",
+  "timed_out",
+]);
 const POLL_INTERVAL_MS = 1500;
 const MAX_POLL_ATTEMPTS = 90;
+const MAX_FIRMWARE_POLL_ATTEMPTS = 190;
 
 const OPERATION_LABELS = {
   command_sent: "Sending configuration to the ESP32…",
@@ -16,6 +28,27 @@ const OPERATION_LABELS = {
   authenticated: "Wi-Fi connected and ESP32 authenticated with the backend.",
   failed: "Wi-Fi configuration failed.",
   timed_out: "The configuration result could not be confirmed in time.",
+  deleted: "Saved Wi-Fi credentials were deleted. The setup access point remains available.",
+};
+
+const FORGET_OPERATION_LABELS = {
+  command_sent: "Sending credential deletion request to the ESP32…",
+  accepted: "ESP32 accepted the credential deletion request…",
+  deleted: OPERATION_LABELS.deleted,
+  failed: "The ESP32 could not delete the saved Wi-Fi credentials.",
+  timed_out: "The deletion result could not be confirmed in time.",
+};
+
+const FIRMWARE_OPERATION_LABELS = {
+  command_sent: "Sending firmware update request…",
+  checking: "Checking the signed GitHub firmware release…",
+  downloading: "Downloading firmware over verified HTTPS…",
+  verifying: "Verifying the signed firmware image…",
+  rebooting: "Firmware installed; waiting for the ESP32 to reconnect…",
+  verified: "The ESP32 reconnected with the updated firmware.",
+  up_to_date: "The ESP32 already has the latest firmware.",
+  failed: "The firmware update failed.",
+  timed_out: "The firmware update could not be confirmed in time.",
 };
 
 function formatLastConnected(value) {
@@ -40,6 +73,11 @@ function RemoteWiFiConfiguration({
   const [busy, setBusy] = useState(false);
   const [operation, setOperation] = useState(null);
   const [error, setError] = useState("");
+  const [forgetOperation, setForgetOperation] = useState(null);
+  const [forgetError, setForgetError] = useState("");
+  const [confirmingForget, setConfirmingForget] = useState(false);
+  const [firmwareOperation, setFirmwareOperation] = useState(null);
+  const [firmwareError, setFirmwareError] = useState("");
   const submitting = useRef(false);
 
   const handleSubmit = async (event) => {
@@ -82,6 +120,93 @@ function RemoteWiFiConfiguration({
     } finally {
       setPassword("");
       setShowPassword(false);
+      setBusy(false);
+      submitting.current = false;
+    }
+  };
+
+  const handleForget = async () => {
+    if (submitting.current) return;
+    submitting.current = true;
+    setBusy(true);
+    setForgetOperation(null);
+    setForgetError("");
+
+    try {
+      const started = await startRemoteWifiForget(sessionToken);
+      let latestOperation = null;
+      for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt += 1) {
+        await waitForNextPoll();
+        latestOperation = await getRemoteWifiForget(
+          sessionToken,
+          started.requestId,
+        );
+        setForgetOperation(latestOperation);
+        if (FORGET_TERMINAL_STATES.has(latestOperation.state)) break;
+      }
+
+      if (latestOperation?.state === "deleted") {
+        await onConfigured();
+      } else if (
+        latestOperation?.state === "failed" ||
+        latestOperation?.state === "timed_out"
+      ) {
+        setForgetError(
+          latestOperation.message || "Wi-Fi credentials could not be deleted.",
+        );
+      } else {
+        setForgetError(
+          "The ESP32 has not confirmed deletion. Check its status before trying again.",
+        );
+      }
+    } catch (requestError) {
+      setForgetError(requestError.message || "Unable to delete Wi-Fi credentials.");
+    } finally {
+      setConfirmingForget(false);
+      setBusy(false);
+      submitting.current = false;
+    }
+  };
+
+  const handleFirmwareUpdate = async () => {
+    if (submitting.current) return;
+    submitting.current = true;
+    setBusy(true);
+    setFirmwareOperation(null);
+    setFirmwareError("");
+
+    try {
+      const started = await startFirmwareUpdate(sessionToken);
+      let latestOperation = null;
+      for (let attempt = 0; attempt < MAX_FIRMWARE_POLL_ATTEMPTS; attempt += 1) {
+        await waitForNextPoll();
+        latestOperation = await getFirmwareUpdate(
+          sessionToken,
+          started.requestId,
+        );
+        setFirmwareOperation(latestOperation);
+        if (FIRMWARE_TERMINAL_STATES.has(latestOperation.state)) break;
+      }
+
+      if (latestOperation?.state === "verified") {
+        await onConfigured();
+      } else if (
+        latestOperation?.state === "failed" ||
+        latestOperation?.state === "timed_out"
+      ) {
+        setFirmwareError(
+          latestOperation.message || FIRMWARE_OPERATION_LABELS[latestOperation.state],
+        );
+      } else if (latestOperation?.state !== "up_to_date") {
+        setFirmwareError(
+          "The ESP32 has not confirmed the update. Check its status before trying again.",
+        );
+      }
+    } catch (requestError) {
+      setFirmwareError(
+        requestError.message || "Unable to update ESP32 firmware.",
+      );
+    } finally {
       setBusy(false);
       submitting.current = false;
     }
@@ -204,7 +329,109 @@ function RemoteWiFiConfiguration({
               <dt>Last connection</dt>
               <dd>{formatLastConnected(wifiStatus?.lastConnectedAt)}</dd>
             </div>
+            <div>
+              <dt>Signal strength</dt>
+              <dd>
+                {Number.isInteger(wifiStatus?.rssi)
+                  ? `${wifiStatus.rssi} dBm`
+                  : "Not reported"}
+              </dd>
+            </div>
+            <div>
+              <dt>Firmware version</dt>
+              <dd>{wifiStatus?.firmwareVersion || "Not reported"}</dd>
+            </div>
           </dl>
+          <div className="forget-wifi-controls">
+            {!confirmingForget ? (
+              <button
+                className="secondary-button"
+                disabled={busy || !deviceConnected}
+                onClick={() => {
+                  setForgetOperation(null);
+                  setForgetError("");
+                  setConfirmingForget(true);
+                }}
+                type="button"
+              >
+                Forget saved Wi-Fi
+              </button>
+            ) : (
+              <div>
+                <p className="feedback warning" role="status">
+                  This permanently deletes saved Wi-Fi credentials from the
+                  ESP32. Its setup access point will remain available.
+                </p>
+                <button
+                  className="secondary-button"
+                  disabled={busy || !deviceConnected}
+                  onClick={() => void handleForget()}
+                  type="button"
+                >
+                  {busy ? "Deleting credentials…" : "Confirm deletion"}
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={busy}
+                  onClick={() => setConfirmingForget(false)}
+                  type="button"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+          </div>
+          {forgetOperation && (
+            <p
+              className={`feedback ${forgetOperation.state === "deleted" ? "success" : "info"}`}
+              role="status"
+              aria-live="polite"
+            >
+              {FORGET_OPERATION_LABELS[forgetOperation.state] ||
+                "Checking Wi-Fi credential deletion…"}
+            </p>
+          )}
+          {forgetError && (
+            <p className="feedback error" role="alert">{forgetError}</p>
+          )}
+          <div className="firmware-update-controls">
+            <h4>Firmware updates</h4>
+            <p>
+              Only newer releases with a valid Ed25519 signature are installed.
+              The ESP32 reboots and confirms its version after reconnecting.
+            </p>
+            <button
+              className="secondary-button"
+              disabled={busy || !deviceConnected}
+              onClick={() => void handleFirmwareUpdate()}
+              type="button"
+            >
+              {busy ? "Firmware operation in progress…" : "Check for signed update"}
+            </button>
+            {firmwareOperation && (
+              <p
+                className={`feedback ${
+                  ["verified", "up_to_date"].includes(firmwareOperation.state)
+                    ? "success"
+                    : firmwareOperation.state === "failed" ||
+                        firmwareOperation.state === "timed_out"
+                      ? "error"
+                      : "info"
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                {FIRMWARE_OPERATION_LABELS[firmwareOperation.state] ||
+                  "Checking firmware update status…"}
+                {firmwareOperation.version
+                  ? ` (v${firmwareOperation.version})`
+                  : ""}
+              </p>
+            )}
+            {firmwareError && (
+              <p className="feedback error" role="alert">{firmwareError}</p>
+            )}
+          </div>
           <p className="remote-wifi-note">
             A successful result means the ESP32 reconnected to the backend.
             Confirm Wi-Fi and LCD behavior on the physical board after setup.

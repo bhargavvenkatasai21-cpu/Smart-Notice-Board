@@ -9,6 +9,8 @@ process.env.DASHBOARD_ORIGIN =
     "http://localhost:5173,https://dashboard.example.test";
 process.env.NOTICE_ACK_TIMEOUT_MS = "300";
 process.env.WIFI_CONFIGURATION_TIMEOUT_MS = "500";
+process.env.WIFI_FORGET_TIMEOUT_MS = "300";
+process.env.FIRMWARE_UPDATE_TIMEOUT_MS = "500";
 
 const { server } = require("./server");
 const DEVICE_TOKEN = process.env.ESP32_DEVICE_TOKEN;
@@ -81,6 +83,9 @@ test("health endpoint is public and reports WebSocket connectivity", async () =>
         response.headers.get("access-control-allow-origin"),
         "https://dashboard.example.test"
     );
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(response.headers.get("x-frame-options"), "DENY");
+    assert.equal(response.headers.get("cache-control"), "no-store");
     assert.deepEqual(await response.json(), {
         status: "OK",
         service: "Smart Notice Board Backend",
@@ -286,7 +291,9 @@ test("Wi-Fi configuration tracks request IDs through reconnect and never returns
         type: "DEVICE_STATUS",
         connected: true,
         ssid: "New office",
-        ip: "192.168.10.20"
+        ip: "192.168.10.20",
+        rssi: -61,
+        firmwareVersion: "1.0.0"
     }));
     newSocket.send(JSON.stringify({
         type: "WIFI_CONFIG_STATUS",
@@ -321,6 +328,8 @@ test("Wi-Fi configuration tracks request IDs through reconnect and never returns
         connected: true,
         ssid: "New office",
         ip: "192.168.10.20",
+        rssi: -61,
+        firmwareVersion: "1.0.0",
         lastConnectedAt: status.wifi.lastConnectedAt
     });
     assert.ok(status.wifi.lastConnectedAt);
@@ -374,6 +383,246 @@ test("Wi-Fi configuration timeout is reported when the ESP32 never reconnects", 
     assert.equal(status.operation.state, "timed_out");
     assert.match(status.operation.message, /Wi-Fi may have connected/);
     assert.equal(JSON.stringify(status).includes("password123"), false);
+});
+
+test("Wi-Fi credential deletion requires a connected authenticated device", async () => {
+    const unauthenticated = await fetch(`${baseUrl}/api/device/wifi-forget`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" }
+    });
+    assert.equal(unauthenticated.status, 401);
+
+    const disconnected = await fetch(`${baseUrl}/api/device/wifi-forget`, {
+        method: "POST",
+        headers: dashboardHeaders()
+    });
+    assert.equal(disconnected.status, 503);
+});
+
+test("Wi-Fi credential deletion reports confirmed, failed, and timed-out operations", async () => {
+    const socket = await connectDevice();
+
+    const requestForget = async () => {
+        const commandReceived = new Promise((resolve, reject) => {
+            const timeout = setTimeout(
+                () => reject(new Error("Wi-Fi forget command was not sent")),
+                1000
+            );
+            socket.once("message", (raw) => {
+                clearTimeout(timeout);
+                resolve(JSON.parse(raw.toString()));
+            });
+        });
+        const response = await fetch(`${baseUrl}/api/device/wifi-forget`, {
+            method: "POST",
+            headers: dashboardHeaders()
+        });
+        const result = await response.json();
+        return { response, result, command: await commandReceived };
+    };
+
+    const failed = await requestForget();
+    assert.equal(failed.response.status, 202);
+    assert.equal(failed.command.type, "WIFI_FORGET");
+    assert.equal(failed.command.requestId, failed.result.requestId);
+    assert.equal(JSON.stringify(failed.result).includes("password"), false);
+
+    const duplicate = await fetch(`${baseUrl}/api/device/wifi-forget`, {
+        method: "POST",
+        headers: dashboardHeaders()
+    });
+    assert.equal(duplicate.status, 409);
+
+    socket.send(JSON.stringify({
+        type: "WIFI_FORGET_STATUS",
+        requestId: failed.command.requestId,
+        state: "accepted"
+    }));
+    socket.send(JSON.stringify({
+        type: "WIFI_FORGET_STATUS",
+        requestId: failed.command.requestId,
+        state: "failed"
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    let statusResponse = await fetch(
+        `${baseUrl}/api/device/wifi-forget/${failed.command.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    let status = await statusResponse.json();
+    assert.equal(statusResponse.status, 200);
+    assert.equal(status.operation.state, "failed");
+
+    const deleted = await requestForget();
+    socket.send(JSON.stringify({
+        type: "WIFI_FORGET_STATUS",
+        requestId: deleted.command.requestId,
+        state: "accepted"
+    }));
+    socket.send(JSON.stringify({
+        type: "WIFI_FORGET_STATUS",
+        requestId: deleted.command.requestId,
+        state: "deleted"
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    statusResponse = await fetch(
+        `${baseUrl}/api/device/wifi-forget/${deleted.command.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    status = await statusResponse.json();
+    assert.equal(status.operation.state, "deleted");
+
+    const timedOut = await requestForget();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    statusResponse = await fetch(
+        `${baseUrl}/api/device/wifi-forget/${timedOut.command.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    status = await statusResponse.json();
+    assert.equal(status.operation.state, "timed_out");
+
+    socket.close();
+    await new Promise((resolve) => socket.once("close", resolve));
+    deviceSocket = null;
+});
+
+test("firmware update is authorized, tracked, and verified after device reconnects", async () => {
+    const unauthenticated = await fetch(
+        `${baseUrl}/api/device/firmware-update`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" }
+        }
+    );
+    assert.equal(unauthenticated.status, 401);
+
+    const disconnected = await fetch(
+        `${baseUrl}/api/device/firmware-update`,
+        {
+            method: "POST",
+            headers: dashboardHeaders()
+        }
+    );
+    assert.equal(disconnected.status, 503);
+
+    const socket = await connectDevice();
+    const commandReceived = new Promise((resolve, reject) => {
+        const timeout = setTimeout(
+            () => reject(new Error("Firmware update command was not sent")),
+            1000
+        );
+        socket.once("message", (raw) => {
+            clearTimeout(timeout);
+            resolve(JSON.parse(raw.toString()));
+        });
+    });
+    const response = await fetch(`${baseUrl}/api/device/firmware-update`, {
+        method: "POST",
+        headers: dashboardHeaders()
+    });
+    const started = await response.json();
+    const command = await commandReceived;
+    assert.equal(response.status, 202);
+    assert.equal(command.type, "FIRMWARE_UPDATE");
+    assert.equal(command.requestId, started.requestId);
+
+    const duplicate = await fetch(`${baseUrl}/api/device/firmware-update`, {
+        method: "POST",
+        headers: dashboardHeaders()
+    });
+    assert.equal(duplicate.status, 409);
+
+    for (const state of ["checking", "downloading", "verifying", "rebooting"]) {
+        socket.send(JSON.stringify({
+            type: "FIRMWARE_UPDATE_STATUS",
+            requestId: command.requestId,
+            state,
+            ...(state === "rebooting" ? { version: "1.0.1" } : {})
+        }));
+    }
+    socket.close();
+    await new Promise((resolve) => socket.once("close", resolve));
+    deviceSocket = null;
+
+    const updatedSocket = await connectDevice();
+    updatedSocket.send(JSON.stringify({
+        type: "DEVICE_STATUS",
+        connected: true,
+        ssid: "Office",
+        ip: "192.168.10.20",
+        rssi: -58,
+        firmwareVersion: "1.0.1"
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    let statusResponse = await fetch(
+        `${baseUrl}/api/device/firmware-update/${command.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    let status = await statusResponse.json();
+    assert.equal(statusResponse.status, 200);
+    assert.equal(status.operation.state, "verified");
+    assert.equal(status.operation.version, "1.0.1");
+
+    const failedCommand = new Promise((resolve, reject) => {
+        const timeout = setTimeout(
+            () => reject(new Error("Second firmware update command was not sent")),
+            1000
+        );
+        updatedSocket.once("message", (raw) => {
+            clearTimeout(timeout);
+            resolve(JSON.parse(raw.toString()));
+        });
+    });
+    const failedResponse = await fetch(
+        `${baseUrl}/api/device/firmware-update`,
+        { method: "POST", headers: dashboardHeaders() }
+    );
+    const failedStart = await failedResponse.json();
+    const failedUpdateCommand = await failedCommand;
+    updatedSocket.send(JSON.stringify({
+        type: "FIRMWARE_UPDATE_STATUS",
+        requestId: failedUpdateCommand.requestId,
+        state: "failed",
+        message: "OTA public key is not configured."
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    statusResponse = await fetch(
+        `${baseUrl}/api/device/firmware-update/${failedStart.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    status = await statusResponse.json();
+    assert.equal(status.operation.state, "failed");
+    assert.equal(status.operation.message, "OTA public key is not configured.");
+
+    const timedOutCommand = new Promise((resolve, reject) => {
+        const timeout = setTimeout(
+            () => reject(new Error("Third firmware update command was not sent")),
+            1000
+        );
+        updatedSocket.once("message", (raw) => {
+            clearTimeout(timeout);
+            resolve(JSON.parse(raw.toString()));
+        });
+    });
+    const timedOutResponse = await fetch(
+        `${baseUrl}/api/device/firmware-update`,
+        { method: "POST", headers: dashboardHeaders() }
+    );
+    const timedOutStart = await timedOutResponse.json();
+    const timedOutUpdateCommand = await timedOutCommand;
+    await new Promise((resolve) => setTimeout(resolve, 550));
+    statusResponse = await fetch(
+        `${baseUrl}/api/device/firmware-update/${timedOutStart.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    status = await statusResponse.json();
+    assert.equal(status.operation.state, "timed_out");
+
+    updatedSocket.close();
+    await new Promise((resolve) => updatedSocket.once("close", resolve));
+    deviceSocket = null;
 });
 
 test("authenticated ESP32 receives notices and confirms delivery", async () => {
@@ -502,4 +751,28 @@ test("logout revokes the dashboard session", async () => {
         headers: { Authorization: `Bearer ${session.sessionToken}` }
     });
     assert.equal(statusResponse.status, 401);
+});
+
+test("login rate limiting blocks repeated incorrect access codes", async () => {
+    const headers = {
+        "Content-Type": "application/json",
+        "X-Forwarded-For": "203.0.113.77"
+    };
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        const response = await fetch(`${baseUrl}/api/auth/login`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ accessCode: "incorrect-rate-limit-code" })
+        });
+        assert.equal(response.status, 401);
+    }
+
+    const limited = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ accessCode: DASHBOARD_ACCESS_CODE })
+    });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.headers.get("retry-after") !== null, true);
 });

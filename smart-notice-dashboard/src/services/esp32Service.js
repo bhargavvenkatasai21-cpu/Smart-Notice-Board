@@ -274,6 +274,106 @@ export async function getRemoteWifiConfiguration(sessionToken, requestId) {
   return operation;
 }
 
+export async function startRemoteWifiForget(sessionToken) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
+    throw new Error("Sign in before deleting ESP32 Wi-Fi credentials.");
+  }
+
+  const result = await requestBackend("/api/device/wifi-forget", {
+    method: "POST",
+    sessionToken,
+  });
+  if (
+    result?.success !== true ||
+    typeof result.requestId !== "string" ||
+    result.state !== "command_sent"
+  ) {
+    throw new Error(
+      result?.message || "The backend did not accept the Wi-Fi deletion request.",
+    );
+  }
+  return result;
+}
+
+export async function getRemoteWifiForget(sessionToken, requestId) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
+    throw new Error("Sign in before checking Wi-Fi credential deletion.");
+  }
+  if (typeof requestId !== "string" || !requestId.trim()) {
+    throw new Error("A Wi-Fi deletion request ID is required.");
+  }
+
+  const result = await requestBackend(
+    `/api/device/wifi-forget/${encodeURIComponent(requestId)}`,
+    { method: "GET", sessionToken },
+  );
+  const operation = result?.operation;
+  if (
+    result?.success !== true ||
+    operation?.requestId !== requestId ||
+    !["command_sent", "accepted", "deleted", "failed", "timed_out"].includes(
+      operation.state,
+    )
+  ) {
+    throw new Error("The backend returned an invalid Wi-Fi deletion status.");
+  }
+  return operation;
+}
+
+export async function startFirmwareUpdate(sessionToken) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
+    throw new Error("Sign in before requesting a firmware update.");
+  }
+
+  const result = await requestBackend("/api/device/firmware-update", {
+    method: "POST",
+    sessionToken,
+  });
+  if (
+    result?.success !== true ||
+    typeof result.requestId !== "string" ||
+    result.state !== "command_sent"
+  ) {
+    throw new Error(
+      result?.message || "The backend did not accept the firmware update request.",
+    );
+  }
+  return result;
+}
+
+export async function getFirmwareUpdate(sessionToken, requestId) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
+    throw new Error("Sign in before checking the firmware update.");
+  }
+  if (typeof requestId !== "string" || !requestId.trim()) {
+    throw new Error("A firmware update request ID is required.");
+  }
+
+  const result = await requestBackend(
+    `/api/device/firmware-update/${encodeURIComponent(requestId)}`,
+    { method: "GET", sessionToken },
+  );
+  const operation = result?.operation;
+  if (
+    result?.success !== true ||
+    operation?.requestId !== requestId ||
+    ![
+      "command_sent",
+      "checking",
+      "downloading",
+      "verifying",
+      "rebooting",
+      "verified",
+      "up_to_date",
+      "failed",
+      "timed_out",
+    ].includes(operation.state)
+  ) {
+    throw new Error("The backend returned an invalid firmware update status.");
+  }
+  return operation;
+}
+
 function assertLocalSetupEnvironment() {
   if (
     !import.meta.env?.DEV ||

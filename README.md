@@ -8,6 +8,7 @@ authenticated ESP32 WebSocket connection and waits for a device acknowledgment.
 
 - `src/main.cpp`: ESP32 firmware, local HTTP Wi-Fi provisioning, LCD display,
   and authenticated secure WebSocket connection to the backend.
+- `src/firmware_update.cpp`: signed, HTTPS-delivered OTA firmware updates.
 - `backend/server.js`: Express API and `/ws` endpoint.
 - `smart-notice-dashboard/`: React 19 + Vite dashboard.
 
@@ -32,11 +33,49 @@ credentials; use the local setup access point for first-time provisioning.
 If the ESP32 cannot reconnect to the backend, its Wi-Fi result may be
 uncertain; check the device through its setup access point.
 
+The dashboard can also request **Forget saved Wi-Fi**. After explicit
+confirmation, the device verifies that NVS credentials were deleted, reports
+the result, and then disconnects its station while keeping the setup access
+point online.
+
 The backend keeps active device coordination and operation results in memory.
 Run a single backend instance: multiple instances do not share device
 connections or Wi-Fi operation state. ESP32 Wi-Fi credentials are stored in
 Preferences/NVS without application-level encryption; protect physical access
 to the board and use a trusted network.
+
+## Signed firmware updates
+
+The dashboard can request a signed update from the device. Firmware downloads
+use verified HTTPS and a GitHub Release manifest; the ESP32 verifies the
+Ed25519 signature, version, image size, SHA-256 digest, and ESP32 image before
+activating the OTA slot. The backend reports an update as verified only after
+the device reboots and reports the expected version.
+
+OTA is intentionally disabled until the owner embeds their own Ed25519 public
+key in `include/ota_config.h`. No private key is in this repository; keep it
+offline and outside the repository. See [OTA_RELEASES.md](./OTA_RELEASES.md)
+for the release process and [SECURITY.md](./SECURITY.md) for limitations.
+Application version checks do not provide Secure Boot, eFuse anti-rollback,
+or hardware-root-of-trust protection.
+
+## Partition layout and migration
+
+The custom 4 MiB table provides two 1,507,328-byte OTA application slots and a
+1 MiB SPIFFS partition. The table changes the SPIFFS offset/size; a manual USB
+migration requires a full flash erase and therefore erases saved Wi-Fi
+credentials in NVS. Do not run the migration until you have physical access
+and can provision the device again. See [PARTITION_MIGRATION.md](./PARTITION_MIGRATION.md).
+
+## Security and deployment
+
+Development builds retain the legacy `12345678` setup-AP password if
+`BOARD_AP_PASSWORD` is not set in the ignored `include/secrets.h`; firmware
+prints a warning in that case. PlatformIO blocks firmware upload unless that
+header defines a custom, non-default 8–63 byte password. Configure a unique
+password before flashing a board.
+Render deployment settings and the single-instance limitation are documented
+in [DEPLOYMENT.md](./DEPLOYMENT.md). No Render settings were changed.
 
 ## Configuration
 
@@ -55,6 +94,12 @@ Render service settings:
   deployed Render Static Site origin and any local development origin).
 - `PORT`: optional; Render assigns this automatically.
 - `NOTICE_ACK_TIMEOUT_MS`: optional acknowledgment timeout; defaults to 10000.
+- `WIFI_CONFIGURATION_TIMEOUT_MS`: optional remote network configuration
+  timeout; defaults to 120000.
+- `WIFI_FORGET_TIMEOUT_MS`: optional credential-deletion confirmation timeout;
+  defaults to 10000.
+- `FIRMWARE_UPDATE_TIMEOUT_MS`: optional OTA completion timeout; defaults to
+  300000.
 
 Keep the access code and device token in untracked backend environment
 settings. Do not place credentials in a `VITE_*` variable: Vite embeds those
@@ -92,10 +137,12 @@ npm run dev
 ```
 
 For local Wi-Fi provisioning, connect the computer or phone to the
-`SmartNoticeBoard` access point (password `12345678`), then open the Vite
-dashboard over HTTP. Submit the router credentials and switch back to the
-router Wi-Fi when the ESP32 reports its IP. A browser cannot switch networks
-automatically. Guest Wi-Fi or client isolation may block local device access.
+`SmartNoticeBoard` access point (use `BOARD_AP_PASSWORD` from
+`include/secrets.h`, or the warned legacy fallback `12345678` in a development
+build), then open the Vite dashboard over HTTP. Submit the router credentials
+and switch back to the router Wi-Fi when the ESP32 reports its IP. A browser
+cannot switch networks automatically.
+Guest Wi-Fi or client isolation may block local device access.
 
 ## Tests and builds
 
@@ -113,8 +160,9 @@ C:\Users\bharg\.platformio\penv\Scripts\pio.exe run
 ```
 
 Backend integration tests use a simulated WebSocket device. They do not replace
-flashing the firmware or verifying the LCD, Wi-Fi behavior, and network
-connectivity on the actual hardware.
+flashing the firmware or verifying the LCD, Wi-Fi behavior, TLS connectivity,
+or OTA on actual hardware. See
+[HARDWARE_TEST_CHECKLIST.md](./HARDWARE_TEST_CHECKLIST.md).
 
 ## Deploy
 

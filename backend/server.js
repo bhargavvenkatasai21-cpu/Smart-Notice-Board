@@ -8,6 +8,8 @@ require("dotenv").config();
 
 const app = express();
 const server = http.createServer(app);
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 5000;
 const DEVICE_TOKEN = process.env.ESP32_DEVICE_TOKEN;
@@ -17,6 +19,13 @@ const NOTICE_ACK_TIMEOUT_MS = Number(process.env.NOTICE_ACK_TIMEOUT_MS) || 10000
 const WIFI_CONFIGURATION_TIMEOUT_MS =
     Number(process.env.WIFI_CONFIGURATION_TIMEOUT_MS) || 120000;
 const WIFI_CONFIGURATION_RETENTION_MS = 10 * 60 * 1000;
+const WIFI_FORGET_TIMEOUT_MS =
+    Number(process.env.WIFI_FORGET_TIMEOUT_MS) || 10000;
+const FIRMWARE_UPDATE_TIMEOUT_MS =
+    Number(process.env.FIRMWARE_UPDATE_TIMEOUT_MS) || 5 * 60 * 1000;
+const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 10;
+const LOGIN_RATE_LIMIT_MAX_CLIENTS = 10000;
 const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const REMEMBERED_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DASHBOARD_ORIGINS = (process.env.DASHBOARD_ORIGIN || "http://localhost:5173")
@@ -27,6 +36,24 @@ const DASHBOARD_ORIGINS = (process.env.DASHBOARD_ORIGIN || "http://localhost:517
 if (!DEVICE_TOKEN || !DASHBOARD_ACCESS_CODE) {
     throw new Error("Missing ESP32_DEVICE_TOKEN or DASHBOARD_ACCESS_CODE in .env");
 }
+
+app.use((req, res, next) => {
+    res.set({
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY"
+    });
+    if (req.secure) {
+        res.setHeader(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains"
+        );
+    }
+    next();
+});
 
 app.use(cors({
     origin: DASHBOARD_ORIGINS,
@@ -48,6 +75,42 @@ function verifyToken(provided, expected) {
 }
 
 const dashboardSessions = new Map();
+const loginAttempts = new Map();
+
+function isLoginRateLimited(clientAddress, now = Date.now()) {
+    for (const [address, attempts] of loginAttempts) {
+        if (attempts.resetAt <= now) {
+            loginAttempts.delete(address);
+        }
+    }
+
+    const attempts = loginAttempts.get(clientAddress);
+    if (attempts && attempts.count >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS) {
+        return attempts.resetAt > now;
+    }
+    return false;
+}
+
+function recordLoginFailure(clientAddress, now = Date.now()) {
+    let attempts = loginAttempts.get(clientAddress);
+    if (!attempts || attempts.resetAt <= now) {
+        if (
+            !loginAttempts.has(clientAddress) &&
+            loginAttempts.size >= LOGIN_RATE_LIMIT_MAX_CLIENTS
+        ) {
+            const oldestAddress = loginAttempts.keys().next().value;
+            if (oldestAddress !== undefined) {
+                loginAttempts.delete(oldestAddress);
+            }
+        }
+        attempts = {
+            count: 0,
+            resetAt: now + LOGIN_RATE_LIMIT_WINDOW_MS
+        };
+        loginAttempts.set(clientAddress, attempts);
+    }
+    attempts.count += 1;
+}
 
 function hashSessionToken(token) {
     return crypto.createHash("sha256").update(token).digest("hex");
@@ -87,6 +150,19 @@ function authenticateDashboard(req, res, next) {
 }
 
 app.post("/api/auth/login", (req, res) => {
+    const clientAddress = req.ip || req.socket.remoteAddress || "unknown";
+    if (isLoginRateLimited(clientAddress)) {
+        const attempts = loginAttempts.get(clientAddress);
+        res.setHeader(
+            "Retry-After",
+            Math.max(1, Math.ceil((attempts.resetAt - Date.now()) / 1000))
+        );
+        return res.status(429).json({
+            success: false,
+            message: "Too many sign-in attempts. Try again later."
+        });
+    }
+
     const accessCode = req.body?.accessCode;
     if (typeof accessCode !== "string" || !accessCode.trim()) {
         return res.status(400).json({
@@ -96,12 +172,14 @@ app.post("/api/auth/login", (req, res) => {
     }
 
     if (!verifyToken(accessCode, DASHBOARD_ACCESS_CODE)) {
+        recordLoginFailure(clientAddress);
         return res.status(401).json({
             success: false,
             message: "Incorrect dashboard access code."
         });
     }
 
+    loginAttempts.delete(clientAddress);
     const session = createDashboardSession(req.body?.rememberMe === true);
     return res.json({ success: true, ...session });
 });
@@ -143,10 +221,16 @@ let lastDeviceCommunicationAt = null;
 const pendingNotices = new Map();
 const wifiConfigurationOperations = new Map();
 let activeWifiConfigurationId = null;
+const wifiForgetOperations = new Map();
+let activeWifiForgetId = null;
+const firmwareUpdateOperations = new Map();
+let activeFirmwareUpdateId = null;
 let deviceWifiStatus = {
     connected: false,
     ssid: "",
     ip: "",
+    rssi: null,
+    firmwareVersion: null,
     lastConnectedAt: null
 };
 
@@ -160,6 +244,24 @@ function cleanWifiConfigurationOperations() {
     for (const [id, operation] of wifiConfigurationOperations) {
         if (operation.expiresAt && operation.expiresAt <= now) {
             wifiConfigurationOperations.delete(id);
+        }
+    }
+}
+
+function cleanWifiForgetOperations() {
+    const now = Date.now();
+    for (const [id, operation] of wifiForgetOperations) {
+        if (operation.expiresAt && operation.expiresAt <= now) {
+            wifiForgetOperations.delete(id);
+        }
+    }
+}
+
+function cleanFirmwareUpdateOperations() {
+    const now = Date.now();
+    for (const [id, operation] of firmwareUpdateOperations) {
+        if (operation.expiresAt && operation.expiresAt <= now) {
+            firmwareUpdateOperations.delete(id);
         }
     }
 }
@@ -251,11 +353,173 @@ function updateWifiConfigurationFromDevice(ws, data) {
     operation.updatedAt = new Date().toISOString();
 }
 
+function publicWifiForget(operation) {
+    return {
+        requestId: operation.id,
+        state: operation.state,
+        message: operation.message,
+        createdAt: operation.createdAt,
+        updatedAt: operation.updatedAt
+    };
+}
+
+function finishWifiForget(operation, state, message) {
+    operation.state = state;
+    operation.message = message;
+    operation.updatedAt = new Date().toISOString();
+    if (["deleted", "failed", "timed_out"].includes(state)) {
+        clearTimeout(operation.timeout);
+        operation.expiresAt = Date.now() + WIFI_CONFIGURATION_RETENTION_MS;
+        if (activeWifiForgetId === operation.id) {
+            activeWifiForgetId = null;
+        }
+    }
+}
+
+function updateWifiForgetFromDevice(ws, data) {
+    if (
+        !isRequestId(data.requestId) ||
+        !["accepted", "deleted", "failed"].includes(data.state)
+    ) {
+        return;
+    }
+
+    const operation = wifiForgetOperations.get(data.requestId);
+    if (
+        !operation ||
+        activeWifiForgetId !== operation.id ||
+        connectedDevice !== ws
+    ) {
+        return;
+    }
+
+    if (data.state === "accepted" && operation.state === "command_sent") {
+        operation.state = "accepted";
+        operation.message = "ESP32 accepted the credential deletion request.";
+        operation.updatedAt = new Date().toISOString();
+    } else if (data.state === "deleted" && operation.state === "accepted") {
+        finishWifiForget(
+            operation,
+            "deleted",
+            "ESP32 confirmed that saved Wi-Fi credentials were deleted."
+        );
+    } else if (data.state === "failed") {
+        finishWifiForget(
+            operation,
+            "failed",
+            "ESP32 could not delete the saved Wi-Fi credentials."
+        );
+    }
+}
+
+function publicFirmwareUpdate(operation) {
+    return {
+        requestId: operation.id,
+        state: operation.state,
+        message: operation.message,
+        version: operation.version || "",
+        createdAt: operation.createdAt,
+        updatedAt: operation.updatedAt
+    };
+}
+
+function finishFirmwareUpdate(operation, state, message, version = operation.version) {
+    operation.state = state;
+    operation.message = message;
+    operation.version = version || "";
+    operation.updatedAt = new Date().toISOString();
+    if (["verified", "up_to_date", "failed", "timed_out"].includes(state)) {
+        clearTimeout(operation.timeout);
+        operation.expiresAt = Date.now() + WIFI_CONFIGURATION_RETENTION_MS;
+        if (activeFirmwareUpdateId === operation.id) {
+            activeFirmwareUpdateId = null;
+        }
+    }
+}
+
+function updateFirmwareUpdateFromDevice(ws, data) {
+    const allowedStates = [
+        "checking",
+        "downloading",
+        "verifying",
+        "rebooting",
+        "up_to_date",
+        "failed"
+    ];
+    if (
+        !isRequestId(data.requestId) ||
+        !allowedStates.includes(data.state) ||
+        (data.version !== undefined &&
+            (typeof data.version !== "string" || data.version.length > 32)) ||
+        (data.message !== undefined &&
+            (typeof data.message !== "string" || data.message.length > 240))
+    ) {
+        return;
+    }
+
+    const operation = firmwareUpdateOperations.get(data.requestId);
+    if (
+        !operation ||
+        activeFirmwareUpdateId !== operation.id ||
+        connectedDevice !== ws
+    ) {
+        return;
+    }
+
+    if (data.state === "failed") {
+        finishFirmwareUpdate(
+            operation,
+            "failed",
+            data.message || "ESP32 firmware update failed."
+        );
+        return;
+    }
+    if (data.state === "up_to_date") {
+        finishFirmwareUpdate(
+            operation,
+            "up_to_date",
+            "ESP32 already has the latest firmware.",
+            data.version
+        );
+        return;
+    }
+
+    const transitions = {
+        command_sent: ["checking"],
+        checking: ["downloading", "rebooting"],
+        downloading: ["verifying"],
+        verifying: ["rebooting"]
+    };
+    if (!transitions[operation.state]?.includes(data.state)) {
+        return;
+    }
+    if (data.state === "rebooting" && !data.version) {
+        return;
+    }
+
+    operation.state = data.state;
+    operation.message = {
+        checking: "Checking the signed GitHub firmware release.",
+        downloading: "Downloading firmware over verified HTTPS.",
+        verifying: "Verifying firmware hash and image before installation.",
+        rebooting: "Firmware installed; waiting for the ESP32 to reconnect."
+    }[data.state];
+    operation.updatedAt = new Date().toISOString();
+    if (data.state === "rebooting") {
+        operation.version = data.version;
+    }
+}
+
 function updateDeviceWifiStatus(data) {
     if (
         typeof data.connected !== "boolean" ||
         typeof data.ssid !== "string" ||
         typeof data.ip !== "string" ||
+        (data.rssi !== undefined &&
+            (!Number.isInteger(data.rssi) || data.rssi < -127 || data.rssi > 0)) ||
+        (data.firmwareVersion !== undefined &&
+            (typeof data.firmwareVersion !== "string" ||
+                data.firmwareVersion.length > 32)) ||
         Buffer.byteLength(data.ssid, "utf8") > 32 ||
         data.ip.length > 45
     ) {
@@ -273,10 +537,29 @@ function updateDeviceWifiStatus(data) {
         connected,
         ssid: connected ? data.ssid : "",
         ip: connected ? data.ip : "",
+        rssi: connected && Number.isInteger(data.rssi) ? data.rssi : null,
+        firmwareVersion: typeof data.firmwareVersion === "string"
+            ? data.firmwareVersion
+            : deviceWifiStatus.firmwareVersion,
         lastConnectedAt: changedConnection
             ? new Date().toISOString()
             : deviceWifiStatus.lastConnectedAt
     };
+
+    const firmwareOperation =
+        firmwareUpdateOperations.get(activeFirmwareUpdateId);
+    if (
+        firmwareOperation?.state === "rebooting" &&
+        typeof data.firmwareVersion === "string" &&
+        data.firmwareVersion === firmwareOperation.version
+    ) {
+        finishFirmwareUpdate(
+            firmwareOperation,
+            "verified",
+            "ESP32 reconnected and reported the updated firmware version.",
+            data.firmwareVersion
+        );
+    }
 }
 
 function settlePendingNotice(requestId, error, acknowledgement) {
@@ -364,6 +647,10 @@ wss.on("connection", (ws) => {
             updateDeviceWifiStatus(data);
         } else if (data.type === "WIFI_CONFIG_STATUS") {
             updateWifiConfigurationFromDevice(ws, data);
+        } else if (data.type === "WIFI_FORGET_STATUS") {
+            updateWifiForgetFromDevice(ws, data);
+        } else if (data.type === "FIRMWARE_UPDATE_STATUS") {
+            updateFirmwareUpdateFromDevice(ws, data);
         } else if (data.type === "NOTICE_ACK" && typeof data.id === "string") {
             const pending = pendingNotices.get(data.id);
             if (pending && pending.device === ws) {
@@ -381,6 +668,8 @@ wss.on("connection", (ws) => {
             }
         } else if (data.type === "PONG") {
             return;
+        } else {
+            ws.close(1008, "Unknown message type");
         }
     });
 
@@ -404,6 +693,7 @@ wss.on("connection", (ws) => {
             deviceWifiStatus.connected = false;
             deviceWifiStatus.ssid = "";
             deviceWifiStatus.ip = "";
+            deviceWifiStatus.rssi = null;
             console.log("ESP32 disconnected.");
         }
         if (
@@ -418,6 +708,35 @@ wss.on("connection", (ws) => {
                     operation,
                     "failed",
                     "ESP32 disconnected before starting the Wi-Fi connection."
+                );
+            }
+        }
+        if (
+            activeWifiForgetId &&
+            ["command_sent", "accepted"].includes(
+                wifiForgetOperations.get(activeWifiForgetId)?.state
+            )
+        ) {
+            const operation = wifiForgetOperations.get(activeWifiForgetId);
+            if (operation?.device === ws) {
+                finishWifiForget(
+                    operation,
+                    "timed_out",
+                    "ESP32 disconnected before confirming Wi-Fi credential deletion."
+                );
+            }
+        }
+        if (
+            activeFirmwareUpdateId &&
+            firmwareUpdateOperations.get(activeFirmwareUpdateId)?.state !==
+                "rebooting"
+        ) {
+            const operation = firmwareUpdateOperations.get(activeFirmwareUpdateId);
+            if (operation?.device === ws) {
+                finishFirmwareUpdate(
+                    operation,
+                    "failed",
+                    "ESP32 disconnected before firmware installation completed."
                 );
             }
         }
@@ -526,6 +845,8 @@ app.post(
     "/api/device/wifi-config",
     authenticateDashboard,
     (req, res) => {
+        cleanWifiConfigurationOperations();
+        cleanWifiForgetOperations();
         const ssid = typeof req.body?.ssid === "string"
             ? req.body.ssid.trim()
             : "";
@@ -564,9 +885,17 @@ app.post(
             });
         }
 
-        if (activeWifiConfigurationId) {
+        if (
+            activeWifiConfigurationId ||
+            activeWifiForgetId ||
+            activeFirmwareUpdateId
+        ) {
             const activeOperation = wifiConfigurationOperations.get(activeWifiConfigurationId);
-            if (activeOperation && !activeOperation.expiresAt) {
+            if (
+                activeWifiForgetId ||
+                activeFirmwareUpdateId ||
+                (activeOperation && !activeOperation.expiresAt)
+            ) {
                 return res.status(409).json({
                     success: false,
                     message: "A Wi-Fi configuration operation is already in progress."
@@ -574,7 +903,6 @@ app.post(
             }
         }
 
-        cleanWifiConfigurationOperations();
         const requestId = crypto.randomUUID();
         const operation = {
             id: requestId,
@@ -653,6 +981,230 @@ app.get(
         return res.json({
             success: true,
             operation: publicWifiConfiguration(operation)
+        });
+    }
+);
+
+app.post(
+    "/api/device/wifi-forget",
+    authenticateDashboard,
+    (req, res) => {
+        cleanWifiConfigurationOperations();
+        cleanWifiForgetOperations();
+        if (
+            !connectedDevice ||
+            connectedDevice.readyState !== WebSocket.OPEN ||
+            !connectedDevice.authenticated
+        ) {
+            return res.status(503).json({
+                success: false,
+                message: "ESP32 is not connected to the backend."
+            });
+        }
+
+        const activeConfiguration = wifiConfigurationOperations.get(
+            activeWifiConfigurationId
+        );
+        if (
+            (activeConfiguration && !activeConfiguration.expiresAt) ||
+            activeWifiForgetId ||
+            activeFirmwareUpdateId
+        ) {
+            return res.status(409).json({
+                success: false,
+                message: "Another Wi-Fi operation is already in progress."
+            });
+        }
+
+        const requestId = crypto.randomUUID();
+        const operation = {
+            id: requestId,
+            state: "command_sent",
+            message: "Wi-Fi credential deletion command sent to ESP32.",
+            device: connectedDevice,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            expiresAt: null,
+            timeout: null
+        };
+        operation.timeout = setTimeout(() => {
+            finishWifiForget(
+                operation,
+                "timed_out",
+                "ESP32 did not confirm Wi-Fi credential deletion."
+            );
+        }, WIFI_FORGET_TIMEOUT_MS);
+        wifiForgetOperations.set(requestId, operation);
+        activeWifiForgetId = requestId;
+
+        try {
+            connectedDevice.send(JSON.stringify({
+                type: "WIFI_FORGET",
+                requestId
+            }), (error) => {
+                if (error) {
+                    finishWifiForget(
+                        operation,
+                        "failed",
+                        "The Wi-Fi deletion command could not be sent to the ESP32."
+                    );
+                }
+            });
+        } catch {
+            finishWifiForget(
+                operation,
+                "failed",
+                "The Wi-Fi deletion command could not be sent to the ESP32."
+            );
+        }
+
+        return res.status(202).json({
+            success: true,
+            requestId,
+            state: operation.state,
+            message: operation.message
+        });
+    }
+);
+
+app.get(
+    "/api/device/wifi-forget/:requestId",
+    authenticateDashboard,
+    (req, res) => {
+        if (!isRequestId(req.params.requestId)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Wi-Fi forget request ID."
+            });
+        }
+
+        cleanWifiConfigurationOperations();
+        cleanWifiForgetOperations();
+        const operation = wifiForgetOperations.get(req.params.requestId);
+        if (!operation || (operation.expiresAt && operation.expiresAt <= Date.now())) {
+            wifiForgetOperations.delete(req.params.requestId);
+            return res.status(404).json({
+                success: false,
+                message: "Wi-Fi forget request was not found or has expired."
+            });
+        }
+
+        return res.json({
+            success: true,
+            operation: publicWifiForget(operation)
+        });
+    }
+);
+
+app.post(
+    "/api/device/firmware-update",
+    authenticateDashboard,
+    (req, res) => {
+        cleanWifiConfigurationOperations();
+        cleanWifiForgetOperations();
+        cleanFirmwareUpdateOperations();
+
+        if (
+            !connectedDevice ||
+            connectedDevice.readyState !== WebSocket.OPEN ||
+            !connectedDevice.authenticated
+        ) {
+            return res.status(503).json({
+                success: false,
+                message: "ESP32 is not connected to the backend."
+            });
+        }
+
+        const activeConfiguration = wifiConfigurationOperations.get(
+            activeWifiConfigurationId
+        );
+        const activeForget = wifiForgetOperations.get(activeWifiForgetId);
+        if (
+            (activeConfiguration && !activeConfiguration.expiresAt) ||
+            (activeForget && !activeForget.expiresAt) ||
+            activeFirmwareUpdateId
+        ) {
+            return res.status(409).json({
+                success: false,
+                message: "Another device operation is already in progress."
+            });
+        }
+
+        const requestId = crypto.randomUUID();
+        const operation = {
+            id: requestId,
+            state: "command_sent",
+            message: "Firmware update request sent to ESP32.",
+            version: "",
+            device: connectedDevice,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            expiresAt: null,
+            timeout: null
+        };
+        operation.timeout = setTimeout(() => {
+            finishFirmwareUpdate(
+                operation,
+                "timed_out",
+                "ESP32 did not confirm firmware installation and reconnection."
+            );
+        }, FIRMWARE_UPDATE_TIMEOUT_MS);
+        firmwareUpdateOperations.set(requestId, operation);
+        activeFirmwareUpdateId = requestId;
+
+        try {
+            connectedDevice.send(JSON.stringify({
+                type: "FIRMWARE_UPDATE",
+                requestId
+            }), (error) => {
+                if (error) {
+                    finishFirmwareUpdate(
+                        operation,
+                        "failed",
+                        "The firmware update command could not be sent to the ESP32."
+                    );
+                }
+            });
+        } catch {
+            finishFirmwareUpdate(
+                operation,
+                "failed",
+                "The firmware update command could not be sent to the ESP32."
+            );
+        }
+
+        return res.status(202).json({
+            success: true,
+            requestId,
+            state: operation.state,
+            message: operation.message
+        });
+    }
+);
+
+app.get(
+    "/api/device/firmware-update/:requestId",
+    authenticateDashboard,
+    (req, res) => {
+        if (!isRequestId(req.params.requestId)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid firmware update request ID."
+            });
+        }
+
+        cleanFirmwareUpdateOperations();
+        const operation = firmwareUpdateOperations.get(req.params.requestId);
+        if (!operation) {
+            return res.status(404).json({
+                success: false,
+                message: "Firmware update request was not found or has expired."
+            });
+        }
+
+        return res.json({
+            success: true,
+            operation: publicFirmwareUpdate(operation)
         });
     }
 );
