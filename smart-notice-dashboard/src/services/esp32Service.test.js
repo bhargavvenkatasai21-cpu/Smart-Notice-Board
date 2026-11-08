@@ -3,6 +3,8 @@ import {
   connectWiFi,
   discoverESP32,
   disconnectWiFi,
+  getBackendHealth,
+  getDeviceStatus,
   getESP32Address,
   getStatus,
   normalizeESP32Address,
@@ -12,6 +14,9 @@ import {
 } from "./esp32Service.js";
 
 const ACCESS_POINT = "http://192.168.4.1";
+const BACKEND =
+  import.meta.env?.VITE_API_BASE_URL ||
+  "https://smart-notice-board-api.onrender.com";
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -251,6 +256,26 @@ describe("Wi-Fi actions", () => {
 });
 
 describe("status and notice API", () => {
+  it("checks backend health independently from device connectivity", async () => {
+    globalThis.fetch = vi.fn(async (url) =>
+      url === `${BACKEND}/api/health`
+        ? jsonResponse({ status: "OK", websocketConnected: false })
+        : jsonResponse({ connected: false, websocketConnected: false }),
+    );
+
+    await expect(getBackendHealth()).resolves.toMatchObject({ status: "OK" });
+    await expect(getDeviceStatus("dashboard-token")).resolves.toMatchObject({
+      connected: false,
+    });
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      `${BACKEND}/api/health`,
+      `${BACKEND}/api/device/status`,
+    ]);
+    expect(fetch.mock.calls[1][1].headers.Authorization).toBe(
+      "Bearer dashboard-token",
+    );
+  });
+
   it.each([
     ["connected", statusResponse({ connected: true, ip: "192.168.1.5" })],
     ["disconnected", statusResponse()],
@@ -277,54 +302,77 @@ describe("status and notice API", () => {
   });
 
   it.each([400, 500])("reports HTTP %s errors", async (code) => {
-    globalThis.fetch = vi.fn(async (url) =>
-      url.endsWith("/status")
-        ? jsonResponse(statusResponse())
-        : jsonResponse({ message: `server error ${code}` }, code),
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ message: `server error ${code}` }, code),
     );
-    await expect(sendNotice("Meeting")).rejects.toThrow(
+    await expect(sendNotice("Meeting", "dashboard-token")).rejects.toThrow(
       `server error ${code}`,
     );
   });
 
-  it("sends a notice to the address found by discovery", async () => {
-    const requests = [];
-    globalThis.fetch = vi.fn(async (url, options) => {
-      requests.push({ url, options });
-      return url.endsWith("/status")
-        ? jsonResponse(
-            statusResponse({
-              connected: true,
-              ssid: "Office",
-              ip: "192.168.1.10",
-            }),
-          )
-        : jsonResponse({ message: "notice displayed" });
-    });
+  it("sends notices through the authenticated backend and requires its delivery confirmation", async () => {
+    const result = {
+      success: true,
+      delivered: true,
+      message: "ESP32 acknowledged the notice command.",
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(result));
 
-    await expect(sendNotice("Meeting at 10")).resolves.toMatchObject({
-      message: "notice displayed",
-    });
-    expect(requests.at(-1).url).toBe(`${ACCESS_POINT}/notice`);
-    expect(JSON.parse(requests.at(-1).options.body)).toEqual({
-      notice: "Meeting at 10",
-    });
+    await expect(sendNotice(" Meeting at 10 ", "dashboard-token")).resolves.toEqual(
+      result,
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/notices`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: "Bearer dashboard-token",
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({ notice: "Meeting at 10" }),
+      }),
+    );
   });
 
-  it("rejects empty and overlength notices without making a request", async () => {
-    await expect(sendNotice("  ")).rejects.toThrow(/Enter a notice/);
-    await expect(sendNotice("x".repeat(201))).rejects.toThrow(
-      /cannot exceed 200/,
+  it("does not claim success if the backend did not confirm delivery", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ success: true, message: "Notice queued" }),
     );
+    await expect(sendNotice("Meeting", "dashboard-token")).rejects.toThrow(
+      /Notice queued/,
+    );
+  });
+
+  it("accepts a notice at the 200-character limit", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ success: true, delivered: true, message: "Acknowledged" }),
+    );
+    const notice = "x".repeat(200);
+    await expect(sendNotice(notice, "dashboard-token")).resolves.toMatchObject({
+      delivered: true,
+    });
+    expect(JSON.parse(fetch.mock.calls[0][1].body).notice).toHaveLength(200);
+  });
+
+  it("rejects empty, overlength, and unauthenticated notices without a request", async () => {
+    await expect(sendNotice("  ", "dashboard-token")).rejects.toThrow(
+      /Enter a notice/,
+    );
+    await expect(
+      sendNotice("x".repeat(201), "dashboard-token"),
+    ).rejects.toThrow(/cannot exceed 200/);
+    await expect(sendNotice("Meeting", "")).rejects.toThrow(/Sign in/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("blocks mixed-content requests from an HTTPS dashboard", async () => {
+  it("blocks local ESP32 requests outside the local HTTP setup environment", async () => {
     vi.stubGlobal("window", {
       location: { protocol: "https:" },
       sessionStorage: window.sessionStorage,
     });
-    await expect(getStatus()).rejects.toThrow(/loaded over HTTPS/);
+    await expect(getStatus()).rejects.toThrow(
+      /local HTTP development dashboard/,
+    );
     expect(fetch).not.toHaveBeenCalled();
   });
 });

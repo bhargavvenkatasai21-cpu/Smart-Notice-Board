@@ -12,20 +12,27 @@
   padding: 34px 0 42px;
 }
 
+.main-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
 .page-nav {
   display: flex;
   align-items: center;
-  gap: 18px;
-  margin-bottom: 36px;
+  gap: 8px;
+  margin-bottom: 26px;
   border-bottom: 1px solid #dfe6f0;
 }
 
 .nav-item {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  min-height: 48px;
-  padding: 0 6px 12px;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 12px 10px;
   color: #64748b;
   background: transparent;
   border: 0;
@@ -60,11 +67,122 @@
   color: #2563eb;
 }
 
+.logout-button {
+  margin: 0 0 12px;
+}
+
 .nav-divider {
   width: 1px;
   height: 20px;
   margin-bottom: 12px;
   background: #dfe6f0;
+}
+
+.status-overview {
+  margin-bottom: 34px;
+  padding: 22px;
+  border: 1px solid #e5eaf2;
+  border-radius: 14px;
+  background: #fff;
+}
+
+.status-overview-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 17px;
+}
+
+.status-overview-heading .eyebrow {
+  margin-bottom: 5px;
+}
+
+.status-overview-heading h2 {
+  margin: 0;
+  color: #1b2f55;
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.refresh-button {
+  min-height: 38px;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.status-tile {
+  display: flex;
+  min-height: 92px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  padding: 13px 15px;
+  border: 1px solid #e8edf4;
+  border-radius: 10px;
+  background: #fbfcfe;
+}
+
+.status-tile-label {
+  color: #77869b;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.status-tile strong {
+  color: #273d5c;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.status-tile-detail {
+  overflow-wrap: anywhere;
+  color: #78869a;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.status-tile-online strong {
+  color: #167447;
+}
+
+.status-tile-offline strong {
+  color: #aa3434;
+}
+
+.status-tile-checking strong,
+.status-tile-unknown strong,
+.status-tile-locked strong {
+  color: #8a6413;
+}
+
+.access-card {
+  max-width: 580px;
+  margin: 0 auto;
+  padding: 26px;
+}
+
+.access-card .card-heading {
+  margin-bottom: 12px;
+}
+
+.access-description {
+  margin: 0 0 22px;
+  color: #66758a;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.access-card input {
+  margin-bottom: 16px;
+}
+
+.access-card .primary-button {
+  width: 100%;
 }
 
 .page-intro {
@@ -313,7 +431,11 @@
 
   .page-nav {
     gap: 12px;
-    margin-bottom: 28px;
+    margin-bottom: 22px;
+  }
+
+  .status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .page-intro {
@@ -324,5 +446,38 @@
 
   .device-chip {
     width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .main-toolbar {
+    align-items: center;
+  }
+
+  .status-overview {
+    padding: 17px;
+  }
+
+  .status-overview-heading {
+    align-items: flex-start;
+  }
+
+  .refresh-button {
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  .status-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .status-tile {
+    min-height: 88px;
+    padding: 11px;
+  }
+
+  .access-card {
+    padding: 21px;
   }
 }

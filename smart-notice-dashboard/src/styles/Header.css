@@ -63,6 +63,14 @@
   white-space: nowrap;
 }
 
+.header-device-status {
+  padding-left: 10px;
+  border-left: 1px solid rgba(255, 255, 255, 0.25);
+  color: #d3def0;
+  font-size: 11px;
+  font-weight: 500;
+}
+
 .status-dot,
 .connection-pulse {
   width: 9px;
@@ -152,12 +160,17 @@
     align-self: flex-start;
     margin: 20px 0 0 auto;
     padding: 7px 9px;
-    font-size: 0;
+    gap: 7px;
+    font-size: 11px;
   }
 
   .header-status .status-dot {
     width: 10px;
     height: 10px;
+  }
+
+  .header-device-status {
+    display: none;
   }
 }
 
@@ -170,5 +183,9 @@
   .header-status {
     margin: 0 0 0 56px;
     font-size: 11px;
+  }
+
+  .header-device-status {
+    display: inline;
   }
 }

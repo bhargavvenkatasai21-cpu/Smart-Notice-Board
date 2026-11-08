@@ -1,16 +1,18 @@
-import StatusBadge from "./StatusBadge.jsx";
 import "./../styles/Header.css";
 
-function Header({ wifiStatus, statusError, statusLoaded }) {
-  const status = statusError
-    ? "unreachable"
-    : !statusLoaded
-      ? "checking"
-    : wifiStatus.connecting
-      ? "connecting"
-      : wifiStatus.connected
-        ? "connected"
-        : "disconnected";
+function Header({ backendOnline, deviceConnected, deviceStatusKnown }) {
+  const status =
+    backendOnline === null
+    ? "checking"
+    : backendOnline
+      ? "connected"
+      : "unreachable";
+  const backendLabel =
+    backendOnline === null
+    ? "Backend checking"
+    : backendOnline
+      ? "Backend online"
+      : "Backend offline";
 
   return (
     <header className="app-header">
@@ -21,7 +23,15 @@ function Header({ wifiStatus, statusError, statusLoaded }) {
           <h1>SMART NOTICE BOARD</h1>
           <p className="header-subtitle">IoT-Based Wireless Notice Display System</p>
         </div>
-        <StatusBadge status={status} />
+        <div className={`header-status status-${status}`} aria-live="polite">
+          <span className="status-dot" aria-hidden="true" />
+          <span>{backendLabel}</span>
+          <span className="header-device-status">
+            {deviceStatusKnown
+              ? `ESP32 ${deviceConnected ? "connected" : "disconnected"}`
+              : "ESP32 status unknown"}
+          </span>
+        </div>
       </div>
     </header>
   );

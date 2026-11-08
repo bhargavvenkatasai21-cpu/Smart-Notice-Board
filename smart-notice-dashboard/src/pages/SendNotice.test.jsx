@@ -1,44 +1,33 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import SendNotice from "./SendNotice.jsx";
-import { sendNotice } from "../services/esp32Service.js";
-
-vi.mock("../services/esp32Service.js", () => ({
-  sendNotice: vi.fn(),
-}));
 
 const connectedProps = {
-  wifiStatus: {
+  backendOnline: true,
+  deviceError: "",
+  deviceStatus: {
     connected: true,
-    connecting: false,
-    ssid: "Home WiFi",
-    ip: "192.168.1.105",
-    apIp: "192.168.4.1",
+    websocketConnected: true,
+    lastSeenAt: "2026-11-08T10:00:00.000Z",
   },
-  statusError: "",
-  statusLoaded: true,
-  deviceAddress: "http://192.168.4.1",
-  refreshStatus: vi.fn().mockResolvedValue({
-    connected: true,
-    ip: "192.168.1.105",
+  latestNotice: null,
+  onSendNotice: vi.fn().mockResolvedValue({
+    success: true,
+    delivered: true,
+    message: "ESP32 acknowledged the notice command.",
   }),
-  onNavigate: vi.fn(),
 };
 
 describe("SendNotice", () => {
-  beforeEach(() => {
-    sendNotice.mockReset();
-  });
-
-  it("shows the discovered device IP and limits notices to 200 characters", () => {
+  it("limits notices to 200 characters and shows the live counter", () => {
     render(<SendNotice {...connectedProps} />);
 
-    expect(screen.getAllByText("192.168.1.105").length).toBeGreaterThan(0);
     expect(screen.getByLabelText("Notice text")).toHaveAttribute(
       "maxLength",
       "200",
     );
+    expect(screen.getByText("0/200")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Send Notice" })).toBeDisabled();
   });
 
@@ -47,55 +36,65 @@ describe("SendNotice", () => {
     fireEvent.submit(screen.getByLabelText("Notice text").closest("form"));
 
     expect(screen.getByText("Enter a notice before sending.")).toBeInTheDocument();
-    expect(sendNotice).not.toHaveBeenCalled();
+    expect(connectedProps.onSendNotice).not.toHaveBeenCalled();
   });
 
-  it("checks current status and reports successful delivery", async () => {
+  it("reports success only after the backend returns an acknowledged delivery", async () => {
     const user = userEvent.setup();
-    sendNotice.mockResolvedValue({ message: "Notice displayed on the LCD" });
-    render(<SendNotice {...connectedProps} />);
+    const onSendNotice = vi.fn().mockResolvedValue({
+      success: true,
+      delivered: true,
+      message: "ESP32 acknowledged the notice command.",
+    });
+    render(<SendNotice {...connectedProps} onSendNotice={onSendNotice} />);
 
     await user.type(screen.getByLabelText("Notice text"), "Meeting at 10");
     await user.click(screen.getByRole("button", { name: "Send Notice" }));
 
     expect(
-      await screen.findByText("Notice displayed on the LCD"),
+      await screen.findByText("ESP32 acknowledged the notice command."),
     ).toBeInTheDocument();
-    expect(connectedProps.refreshStatus).toHaveBeenCalled();
-    expect(sendNotice).toHaveBeenCalledWith("Meeting at 10");
+    expect(onSendNotice).toHaveBeenCalledWith("Meeting at 10");
   });
 
-  it("does not submit when disconnected and explains send failures", async () => {
+  it("does not submit when disconnected and explains backend failures", async () => {
     const user = userEvent.setup();
-    sendNotice.mockRejectedValue(new Error("ESP32 request timed out"));
+    const onSendNotice = vi.fn().mockRejectedValue(new Error("ESP32 is offline."));
+    render(<SendNotice {...connectedProps} onSendNotice={onSendNotice} />);
+
+    await user.type(screen.getByLabelText("Notice text"), "Meeting at 10");
+    await user.click(screen.getByRole("button", { name: "Send Notice" }));
+    expect(await screen.findByText("ESP32 is offline.")).toBeInTheDocument();
+
     render(
       <SendNotice
         {...connectedProps}
-        refreshStatus={vi.fn().mockResolvedValue({ connected: true })}
+        backendOnline={true}
+        deviceStatus={{ connected: false }}
       />,
     );
-
-    await user.type(screen.getByLabelText("Notice text"), "Meeting at 10");
-    await user.click(screen.getByRole("button", { name: "Send Notice" }));
     expect(
-      await screen.findByText("ESP32 request timed out"),
+      screen.getByText(/ESP32 is disconnected/),
     ).toBeInTheDocument();
   });
 
-  it("blocks notice delivery if status confirms the board is disconnected", async () => {
+  it("prevents duplicate submissions while a notice is processing", async () => {
     const user = userEvent.setup();
-    render(
-      <SendNotice
-        {...connectedProps}
-        refreshStatus={vi.fn().mockResolvedValue({ connected: false })}
-      />,
+    let resolveSend;
+    const onSendNotice = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveSend = resolve;
+        }),
     );
+    render(<SendNotice {...connectedProps} onSendNotice={onSendNotice} />);
+
     await user.type(screen.getByLabelText("Notice text"), "Meeting at 10");
     await user.click(screen.getByRole("button", { name: "Send Notice" }));
+    expect(screen.getByRole("button", { name: /Sending/ })).toBeDisabled();
+    expect(onSendNotice).toHaveBeenCalledTimes(1);
 
-    expect(
-      await screen.findByText("The ESP32 is disconnected. Reconnect before sending a notice."),
-    ).toBeInTheDocument();
-    expect(sendNotice).not.toHaveBeenCalled();
+    resolveSend({ success: true, delivered: true, message: "Acknowledged" });
+    expect(await screen.findByText("Acknowledged")).toBeInTheDocument();
   });
 });

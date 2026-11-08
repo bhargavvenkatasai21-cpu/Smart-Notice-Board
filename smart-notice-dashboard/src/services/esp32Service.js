@@ -2,7 +2,11 @@ const ADDRESS_KEY = "smart-notice-board-address";
 const STATION_ADDRESS_KEY = "smart-notice-board-station-address";
 const AP_ADDRESS_KEY = "smart-notice-board-ap-address";
 const REQUEST_TIMEOUT_MS = 2500;
+const BACKEND_REQUEST_TIMEOUT_MS = 15000;
 const MAX_NOTICE_LENGTH = 200;
+const DEFAULT_BACKEND_URL =
+  import.meta.env?.VITE_API_BASE_URL ||
+  "https://smart-notice-board-api.onrender.com";
 const DEFAULT_AP_ADDRESS =
   import.meta.env?.VITE_ESP32_AP_URL || "http://192.168.4.1";
 
@@ -49,6 +53,121 @@ export function setESP32Address(address) {
   const normalizedAddress = normalizeESP32Address(address);
   sessionStorage()?.setItem(ADDRESS_KEY, normalizedAddress);
   return normalizedAddress;
+}
+
+function getBackendUrl() {
+  try {
+    const url = new URL(DEFAULT_BACKEND_URL);
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      !url.hostname ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash
+    ) {
+      throw new Error("Use an HTTP(S) backend origin without credentials or a path.");
+    }
+    return url.origin;
+  } catch (error) {
+    throw new Error("VITE_API_BASE_URL must be a valid HTTP(S) URL.", {
+      cause: error,
+    });
+  }
+}
+
+async function requestBackend(path, { token, ...options } = {}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    BACKEND_REQUEST_TIMEOUT_MS,
+  );
+  const headers = {
+    Accept: "application/json",
+    ...options.headers,
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  let response;
+  try {
+    response = await fetch(`${getBackendUrl()}${path}`, {
+      ...options,
+      headers,
+      signal: controller.signal,
+      cache: "no-store",
+    });
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("The backend request timed out. Try again shortly.", {
+        cause: error,
+      });
+    }
+    if (error instanceof TypeError) {
+      throw new Error(
+        "Cannot reach the Smart Notice Board backend. It may be starting up or temporarily unavailable.",
+        { cause: error },
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    throw new Error("The backend returned an invalid response.", {
+      cause: error,
+    });
+  }
+
+  if (!response.ok) {
+    const message =
+      typeof data?.message === "string"
+        ? data.message
+        : `Backend request failed with HTTP ${response.status}.`;
+    throw new Error(message);
+  }
+
+  return data;
+}
+
+export async function getBackendHealth() {
+  const health = await requestBackend("/api/health", { method: "GET" });
+  if (health?.status !== "OK") {
+    throw new Error("The backend health check returned an unexpected status.");
+  }
+  return health;
+}
+
+export async function getDeviceStatus(token) {
+  if (typeof token !== "string" || !token.trim()) {
+    throw new Error("Enter the dashboard access token.");
+  }
+  const status = await requestBackend("/api/device/status", {
+    method: "GET",
+    token,
+  });
+  if (typeof status?.connected !== "boolean") {
+    throw new Error("The backend returned an invalid device status response.");
+  }
+  return status;
+}
+
+function assertLocalSetupEnvironment() {
+  if (
+    !import.meta.env?.DEV ||
+    (typeof window !== "undefined" &&
+      window.location?.protocol !== "http:")
+  ) {
+    throw new Error(
+      "Wi-Fi provisioning is available only from the local HTTP development dashboard. Open it on a device that can reach the ESP32 setup access point.",
+    );
+  }
 }
 
 function getStationAddress() {
@@ -156,6 +275,7 @@ function discoveryCandidates() {
 }
 
 export async function discoverESP32() {
+  assertLocalSetupEnvironment();
   const failures = [];
 
   for (const address of discoveryCandidates()) {
@@ -236,20 +356,29 @@ export async function reconnectWiFi() {
   return requestAt(discovery.reachableAddress, "/reconnect", { method: "POST" });
 }
 
-export async function sendNotice(notice) {
+export async function sendNotice(notice, token) {
   if (typeof notice !== "string" || !notice.trim()) {
     throw new Error("Enter a notice before sending.");
   }
   if (notice.length > MAX_NOTICE_LENGTH) {
     throw new Error("Notices cannot exceed 200 characters.");
   }
+  if (typeof token !== "string" || !token.trim()) {
+    throw new Error("Sign in before sending a notice.");
+  }
 
-  const discovery = await discoverESP32();
-  return requestAt(discovery.reachableAddress, "/notice", {
+  const result = await requestBackend("/api/notices", {
     method: "POST",
+    token,
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ notice }),
+    body: JSON.stringify({ notice: notice.trim() }),
   });
+  if (result?.success !== true || result?.delivered !== true) {
+    throw new Error(
+      result?.message || "The backend did not confirm delivery to the ESP32.",
+    );
+  }
+  return result;
 }
 
 export async function checkESP32() {

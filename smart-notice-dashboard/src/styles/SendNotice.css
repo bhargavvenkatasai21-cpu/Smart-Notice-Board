@@ -23,6 +23,32 @@
   margin-top: 22px;
 }
 
+.latest-notice {
+  margin-top: 24px;
+  padding: 16px;
+  border: 1px solid #e4eaf3;
+  border-radius: 10px;
+  background: #f8fafd;
+}
+
+.latest-notice .eyebrow {
+  margin-bottom: 8px;
+}
+
+.latest-notice > p:not(.eyebrow) {
+  overflow-wrap: anywhere;
+  color: #263b59;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.latest-notice time {
+  display: block;
+  margin-top: 8px;
+  color: #78869a;
+  font-size: 11px;
+}
+
 .send-button {
   min-width: 168px;
 }
@@ -32,10 +58,7 @@
 }
 
 .notice-footer {
-  display: flex;
-  justify-content: space-between;
   align-items: center;
-  gap: 16px;
   margin-top: 25px;
   padding-top: 19px;
   border-top: 1px solid #edf0f5;
@@ -86,11 +109,6 @@
 @media (max-width: 600px) {
   .notice-card {
     padding: 21px;
-  }
-
-  .notice-footer {
-    align-items: flex-start;
-    flex-direction: column;
   }
 
   .textarea-meta {

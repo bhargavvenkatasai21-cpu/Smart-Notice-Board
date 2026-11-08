@@ -1,25 +1,24 @@
-function Navbar({ activePage, isConnected, onNavigate }) {
+function Navbar({ activePage, showSetup, onNavigate }) {
   return (
     <nav className="page-nav" aria-label="Dashboard pages">
       <button
-        className={`nav-item ${activePage === "wifi" ? "is-active" : ""}`}
-        onClick={() => onNavigate("wifi")}
+        aria-current={activePage === "dashboard" ? "page" : undefined}
+        className={`nav-item ${activePage === "dashboard" ? "is-active" : ""}`}
+        onClick={() => onNavigate("dashboard")}
         type="button"
       >
-        <span className="nav-step">01</span>
-        Wi-Fi Settings
+        Dashboard
       </button>
-      <span className="nav-divider" aria-hidden="true" />
-      <button
-        aria-disabled={!isConnected}
-        className={`nav-item ${activePage === "notice" ? "is-active" : ""}`}
-        disabled={!isConnected}
-        onClick={() => onNavigate("notice")}
-        type="button"
-      >
-        <span className="nav-step">02</span>
-        Send Notice
-      </button>
+      {showSetup && (
+        <button
+          aria-current={activePage === "setup" ? "page" : undefined}
+          className={`nav-item ${activePage === "setup" ? "is-active" : ""}`}
+          onClick={() => onNavigate("setup")}
+          type="button"
+        >
+          Device setup
+        </button>
+      )}
     </nav>
   );
 }

@@ -1,35 +1,33 @@
 import { useState } from "react";
 import LoadingSpinner from "../components/LoadingSpinner.jsx";
 import StatusBadge from "../components/StatusBadge.jsx";
-import { sendNotice } from "../services/esp32Service.js";
 import "../styles/SendNotice.css";
 
 function SendNotice({
-  wifiStatus,
-  statusError,
-  statusLoaded,
-  connectionFeedback,
-  deviceAddress,
-  refreshStatus,
-  onNavigate,
+  backendOnline,
+  deviceError,
+  deviceStatus,
+  latestNotice,
+  onSendNotice,
 }) {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState(null);
-
-  const connected = wifiStatus.connected && !statusError;
-  const status = statusError
-    ? "unreachable"
-    : !statusLoaded
-      ? "checking"
-    : wifiStatus.connecting
-      ? "connecting"
-      : connected
-        ? "connected"
-        : "disconnected";
+  const connected = backendOnline === true && deviceStatus?.connected === true;
+  const status =
+    backendOnline === false
+      ? "unreachable"
+      : backendOnline === null
+        ? "checking"
+        : deviceError
+          ? "unreachable"
+          : connected
+            ? "connected"
+            : "disconnected";
 
   const handleSubmit = async (event) => {
     event.preventDefault();
+    if (busy) return;
     if (!notice.trim()) {
       setFeedback({ kind: "error", message: "Enter a notice before sending." });
       return;
@@ -37,25 +35,18 @@ function SendNotice({
 
     setBusy(true);
     setFeedback(null);
-
     try {
-      const latestStatus = await refreshStatus();
-      if (!latestStatus) {
-        throw new Error("Cannot verify the ESP32 connection. Check its network access and try again.");
-      }
-      if (!latestStatus.connected) {
-        throw new Error("The ESP32 is disconnected. Reconnect before sending a notice.");
-      }
-
-      const result = await sendNotice(notice);
+      const result = await onSendNotice(notice);
       setFeedback({
         kind: "success",
-        message: result?.message || "Notice sent to the display.",
+        message:
+          result.message ||
+          "The ESP32 acknowledged the notice. LCD output cannot be sensed by the backend.",
       });
     } catch (error) {
       setFeedback({
         kind: "error",
-        message: error.message || "Unable to send the notice.",
+        message: error.message || "Unable to deliver the notice.",
       });
     } finally {
       setBusy(false);
@@ -68,19 +59,12 @@ function SendNotice({
         <div>
           <p className="eyebrow">NOTICE MANAGEMENT</p>
           <h2>Send a notice</h2>
-          <p>Send an announcement directly to your 16-character LCD.</p>
-        </div>
-        <div className="device-chip">
-          <span className="device-chip-label">ESP32 ADDRESS</span>
-          <strong>{wifiStatus.ip || deviceAddress}</strong>
+          <p>
+            Send a message through the backend. Success is shown only after the
+            connected ESP32 acknowledges it.
+          </p>
         </div>
       </section>
-
-      {connectionFeedback && (
-        <p className={`feedback ${connectionFeedback.kind}`} role="status">
-          {connectionFeedback.message}
-        </p>
-      )}
 
       <section className="card notice-card">
         <div className="card-heading">
@@ -88,7 +72,6 @@ function SendNotice({
             <p className="eyebrow">DISPLAY MESSAGE</p>
             <h3>Compose your notice</h3>
           </div>
-          <span className="card-icon" aria-hidden="true">✦</span>
         </div>
 
         <form onSubmit={handleSubmit}>
@@ -100,13 +83,13 @@ function SendNotice({
               setNotice(event.target.value);
               setFeedback(null);
             }}
-            placeholder="Type the message you want to display on your notice board…"
-            rows="7"
+            placeholder="Write a short announcement for your notice board"
+            rows="6"
             value={notice}
           />
           <div className="textarea-meta">
-            <span>Keep your message clear and easy to read (maximum 200 characters).</span>
-            <span>{notice.length}/200 characters</span>
+            <span>Maximum 200 characters.</span>
+            <span aria-live="polite">{notice.length}/200</span>
           </div>
 
           <div className="notice-actions">
@@ -119,6 +102,7 @@ function SendNotice({
             </button>
             <button
               className="outline-button clear-button"
+              disabled={busy || !notice}
               onClick={() => {
                 setNotice("");
                 setFeedback(null);
@@ -136,27 +120,33 @@ function SendNotice({
           </p>
         )}
         {!connected && (
-          <p className="feedback error" role="status">
-            {statusError
-              ? "The ESP32 cannot be reached. Check the network connection."
-              : statusLoaded
-                ? "The ESP32 is disconnected. Reconnect from Wi-Fi Settings before sending."
-                : "Checking the ESP32 connection…"}
+          <p className={`feedback ${backendOnline === false || deviceError ? "error" : ""}`} role="status">
+            {backendOnline === false
+              ? "The backend is unavailable. Notice delivery is paused."
+              : deviceError
+                ? `Device status could not be verified: ${deviceError}`
+                : backendOnline === null
+                  ? "Checking backend availability…"
+                  : "The ESP32 is disconnected. Reconnect it before sending a notice."}
           </p>
+        )}
+
+        {latestNotice?.notice && (
+          <section className="latest-notice" aria-label="Latest delivered notice">
+            <p className="eyebrow">LATEST ACKNOWLEDGED NOTICE</p>
+            <p>{latestNotice.notice}</p>
+            {latestNotice.sentAt && (
+              <time dateTime={latestNotice.sentAt}>
+                {new Date(latestNotice.sentAt).toLocaleString()}
+              </time>
+            )}
+          </section>
         )}
 
         <div className="notice-footer">
           <div className="mini-connection">
             <StatusBadge status={status} />
-            <span className="mini-ip">{wifiStatus.ip || "IP unavailable"}</span>
           </div>
-          <button
-            className="text-button"
-            onClick={() => onNavigate("wifi")}
-            type="button"
-          >
-            ← Back to Wi-Fi Settings
-          </button>
         </div>
       </section>
     </>
