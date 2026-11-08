@@ -36,6 +36,9 @@ unsigned long connectionStartedAt = 0;
 unsigned long lastReconnectAttemptAt = 0;
 String connectionTargetSsid;
 String connectionError;
+volatile bool stationGotIpEvent = false;
+volatile bool stationDisconnectedEvent = false;
+volatile uint8_t stationDisconnectReason = 0;
 
 enum class CredentialLoadResult {
     Loaded,
@@ -302,7 +305,8 @@ void handleNotice() {
     }
 
     if (newNotice.length() > kMaxNoticeLength) {
-        newNotice = newNotice.substring(0, kMaxNoticeLength);
+        sendMessage(413, "Notice cannot exceed 200 characters");
+        return;
     }
 
     notice = newNotice;
@@ -333,12 +337,18 @@ void handleRoot() {
 void handleStatus() {
     JsonDocument document;
     const bool connected = connectedToTargetNetwork();
+    String savedSsid;
+    String savedPassword;
+    const CredentialLoadResult credentialResult =
+        loadSavedCredentials(savedSsid, savedPassword);
 
     document["connected"] = connected;
     document["connecting"] = connectionInProgress;
     document["ip"] = connected ? WiFi.localIP().toString() : "";
     document["ssid"] = connected ? WiFi.SSID() : "";
     document["apIp"] = WiFi.softAPIP().toString();
+    document["savedCredentials"] =
+        credentialResult == CredentialLoadResult::Loaded;
     document["connectionError"] = connectionError;
     sendJson(200, document);
 }
@@ -386,6 +396,20 @@ void setupServer() {
 
 void updateConnectionState() {
     const unsigned long now = millis();
+
+    if (stationDisconnectedEvent) {
+        stationDisconnectedEvent = false;
+        Serial.printf(
+            "WiFi station disconnected (reason %u)\n",
+            stationDisconnectReason);
+    }
+
+    if (stationGotIpEvent) {
+        stationGotIpEvent = false;
+        Serial.print("WiFi station received IP: ");
+        Serial.println(WiFi.localIP());
+    }
+
     if (WiFi.status() != WL_CONNECTED) {
         connectionSawDisconnect = true;
     }
@@ -455,6 +479,14 @@ void setup() {
 
     WiFi.mode(WIFI_AP_STA);
     WiFi.setAutoReconnect(true);
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+            stationGotIpEvent = true;
+        } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+            stationDisconnectReason = info.wifi_sta_disconnected.reason;
+            stationDisconnectedEvent = true;
+        }
+    });
 
     startAccessPoint();
     setupServer();

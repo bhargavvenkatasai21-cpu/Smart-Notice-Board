@@ -1,8 +1,9 @@
 # Smart Notice Board test report
 
-**Run date:** 2026-11-08  
+**Automated check date:** 2026-11-08  
 **Firmware target:** PlatformIO `esp32dev`, ESP32 Arduino framework  
-**Scope:** Code inspection and automated checks after the firmware and dashboard changes.
+**Scope:** Code inspection, frontend automated tests, production build, lint, and
+firmware compilation after the dynamic-IP provisioning changes.
 
 The hardware results below are the results supplied by the project owner. They
 were not rerun after these changes because no ESP32, LCD, or project Wi-Fi
@@ -21,7 +22,7 @@ provided and the behavior still needs physical verification.
 | 8 | Sending a short notice | Notice appears left-aligned on the LCD. | Owner reported pass before these changes. | PASS (owner-reported baseline) | New firmware has not been tested on the LCD. | Retest after flashing. |
 | 9 | Sending exactly 16 characters | All 16 characters display in order with no scroll. | Owner reported pass before these changes. | PASS (owner-reported baseline) | New firmware has not been tested on the LCD. | Retest after flashing. |
 | 10 | Sending a long notice | Message scrolls one character per step and repeats. | Owner reported long-notice scrolling passed before these changes. | PASS (owner-reported baseline) | The reported result does not confirm the starting character or restart boundary. | Verify the first and final frames after flashing. |
-| 11 | 200-character notice limit | Input is capped at 200 characters and renders without overflow. | Owner reported not tested. | NOT TESTED | The firmware truncates notices to 200 characters. | Submit more than 200 characters and confirm the displayed/stored text is capped. |
+| 11 | 200-character notice limit | Exactly 200 characters are accepted; longer notices are rejected. | Frontend service tests verify the 200-character limit; physical request was not run. | PASS (automated validation) / NOT TESTED (hardware) | No physical ESP32 was available. | Verify HTTP 413 for a notice longer than 200 characters after flashing. |
 | 12 | Empty notice rejection | Empty or whitespace-only notice returns an error and does not replace the current notice. | Owner reported pass before these changes. | PASS (owner-reported baseline) | New firmware has not been tested on the board. | Retest after flashing. |
 | 13 | Scrolling starts at the first character | The initial frame begins with character 1 and is held for five seconds. | Earlier reported LCD behavior began in the middle despite the counter starting at zero; post-change hardware result is unavailable. | FAIL (previous observation; retest required) | The frame calculation starts at offset zero and the cursor is explicitly set for both DDRAM sections. The remaining discrepancy needs physical verification of the JHD161A's section addressing, wiring, and RW/ground connections. | Flash and verify a known 20+ character test notice from its first character; inspect wiring/addressing if it still appears shifted. |
 | 14 | Scrolling restart | The trailing frame completes and the notice restarts at character 1. | No hardware result supplied. | NOT TESTED | Scroll wrap logic compiles but has not been observed on the display. | Watch at least one full cycle after flashing. |
@@ -36,21 +37,33 @@ provided and the behavior still needs physical verification.
 
 | Check | Result | Notes |
 |---|---|---|
-| PlatformIO firmware build | PASS | `platformio run`, ESP32 framework 3.3.12; no compiler warnings appeared in the build output. |
+| PlatformIO firmware build | PASS | `C:\Users\bharg\.platformio\penv\Scripts\pio.exe run`; ESP32 framework 3.3.12; no compiler warnings appeared in the build output. The `pio` command itself is not on PATH. |
 | PlatformIO dependencies | PASS | Resolved `LiquidCrystal 1.0.7`, `ArduinoJson 7.4.3`, `Preferences`, `WebServer`, and `WiFi`. |
 | Dashboard production build | PASS | `npm run build`; Vite 8.3.6. |
 | Dashboard lint | PASS | `npm run lint`; no errors or warnings. |
-| Dashboard API tests | PASS | `npm test`; 6 tests cover address validation/storage, endpoint/payload mapping, response validation, HTTP/network errors, and HTTPS-to-HTTP blocking. |
+| React service tests | PASS | Included in `npm test`; 21 tests cover discovery, DHCP address changes, Wi-Fi actions, request timeouts, response validation, HTTP/network errors, and notices. |
+| React component tests | PASS | Included in `npm test`; 17 tests cover app navigation/status, Wi-Fi settings, and notice composition/submission. |
+| Complete dashboard test suite | PASS | `npm test`; all 38 tests passed across 4 test files. |
 | Firmware logic unit tests | NOT AVAILABLE | The project has no host-side firmware unit-test harness. Scroll boundaries and Wi-Fi transitions still need board-level verification. |
-| Browser smoke check | PARTIAL | The React screen rendered after a full reload; empty-SSID, short-password, and invalid-address validation worked. Hot reload through the forwarded tunnel briefly returned 504s. The forwarded page used HTTPS and the browser blocked HTTP requests to the ESP32; no device integration was possible. |
+| Browser/device integration check | NOT TESTED | No physical ESP32, LCD, or project Wi-Fi network was accessible. HTTPS mixed-content behavior and provisioning handoff are covered by service/component code checks, not a live-browser-to-device test. |
 
 ## Findings and retest notes
 
-- The dashboard previously sent every request to `10.178.221.82`, while UI
-  fallbacks also contained `10.183.44.82`. Neither address was derived from the
-  ESP32's current DHCP lease. The dashboard now has a configurable address
-  saved in browser storage, with the firmware's setup AP address as the initial
-  default.
+- The dashboard previously sent requests to fixed router IP addresses, which
+  could become stale after DHCP reassignment. Discovery now probes only known
+  addresses: the setup AP (`192.168.4.1`), a manually configured override, and
+  the last station IP reported by the ESP32. A successful `/status` response
+  refreshes the station IP in session storage; the browser does not scan
+  arbitrary LAN addresses.
+- Provisioning requires the user to connect their phone/computer to
+  `SmartNoticeBoard` (password `12345678`), open the dashboard over HTTP, submit
+  router credentials, then manually return to the router Wi-Fi after the board
+  reports its DHCP IP. A browser cannot switch its own network connection.
+- If the router uses guest-network isolation, client-isolation settings, or
+  otherwise blocks device-to-device traffic, the dashboard cannot reach the
+  station IP. Keep the setup AP reachable for provisioning or use a VPN/secure
+  relay; HTTPS hosting also requires an HTTPS reverse proxy or secure relay
+  because browsers block direct HTTPS-page-to-HTTP-device requests.
 - A dashboard served over HTTPS cannot directly call this firmware's HTTP
   server from a browser. Use the dashboard over HTTP on a network that can
   reach the ESP32, or place an HTTPS proxy in front of the device.
@@ -63,8 +76,36 @@ provided and the behavior still needs physical verification.
   before dropping the station, and the dashboard switches to the AP address
   for the subsequent reconnect action.
 - The JHD161A's one visible row uses two 8-character DDRAM sections. The
-  existing GPIO mapping is unchanged; the firmware writes the first half at
-  row-0 address and the second half at row-1 address. The LCD now shows the
-  actual station IP after connection.
+  existing GPIO mapping is unchanged; the firmware retains the split-write
+  behavior. The firmware now enforces the 200-character notice maximum and
+  keeps the second display row blank. These LCD behaviors have not been
+  confirmed on the physical display after the changes.
 - No claim of physical LCD, Wi-Fi, or ESP32 integration success is made for the
   revised firmware until the owner runs the hardware tests above.
+
+## Run and upload commands
+
+Start the dashboard over HTTP so the browser can communicate with the ESP32:
+
+```powershell
+Set-Location D:\iot\Smart-Notice-Board\smart-notice-dashboard
+npm run dev -- --host 0.0.0.0
+```
+
+Open `http://localhost:5173` in a browser on the same computer. For first-time
+provisioning, connect that computer or phone to `SmartNoticeBoard`, submit the
+router credentials, wait for the reported station IP, then manually reconnect
+the computer or phone to the router Wi-Fi.
+
+Build, upload, and open the serial monitor from the project root:
+
+```powershell
+Set-Location D:\iot\Smart-Notice-Board
+C:\Users\bharg\.platformio\penv\Scripts\pio.exe run
+C:\Users\bharg\.platformio\penv\Scripts\pio.exe run --target upload
+C:\Users\bharg\.platformio\penv\Scripts\pio.exe device monitor --baud 115200
+```
+
+If PlatformIO cannot identify the serial port, specify it with `--environment
+esp32dev --upload-port COMx` and `--port COMx` for the monitor, replacing
+`COMx` with the ESP32's port in Device Manager.

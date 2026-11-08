@@ -1,17 +1,16 @@
-const DEVICE_URL_STORAGE_KEY = "smart-notice-board-device-url";
-const REQUEST_TIMEOUT_MS = 8000;
-const DEFAULT_DEVICE_URL =
-  import.meta.env?.VITE_ESP32_URL || "http://192.168.4.1";
+const ADDRESS_KEY = "smart-notice-board-address";
+const STATION_ADDRESS_KEY = "smart-notice-board-station-address";
+const AP_ADDRESS_KEY = "smart-notice-board-ap-address";
+const REQUEST_TIMEOUT_MS = 2500;
+const MAX_NOTICE_LENGTH = 200;
+const DEFAULT_AP_ADDRESS =
+  import.meta.env?.VITE_ESP32_AP_URL || "http://192.168.4.1";
 
-export function getDeviceBaseUrl() {
-  const savedUrl =
-    typeof window === "undefined"
-      ? ""
-      : window.localStorage.getItem(DEVICE_URL_STORAGE_KEY);
-  return savedUrl || DEFAULT_DEVICE_URL;
+function sessionStorage() {
+  return typeof window === "undefined" ? null : window.sessionStorage;
 }
 
-export function normalizeDeviceBaseUrl(value) {
+export function normalizeESP32Address(value) {
   const input = value.trim();
   if (!input) {
     throw new Error("Enter the ESP32 IP address or host name.");
@@ -39,35 +38,51 @@ export function normalizeDeviceBaseUrl(value) {
   return url.origin;
 }
 
-export function saveDeviceBaseUrl(value) {
-  const normalizedUrl = normalizeDeviceBaseUrl(value);
-  window.localStorage.setItem(DEVICE_URL_STORAGE_KEY, normalizedUrl);
-  return normalizedUrl;
+export function getESP32Address() {
+  return (
+    sessionStorage()?.getItem(ADDRESS_KEY) ||
+    normalizeESP32Address(DEFAULT_AP_ADDRESS)
+  );
 }
 
-async function request(path, options = {}) {
-  let response;
-  const deviceUrl = getDeviceBaseUrl();
-  const parsedDeviceUrl = new URL(deviceUrl);
+export function setESP32Address(address) {
+  const normalizedAddress = normalizeESP32Address(address);
+  sessionStorage()?.setItem(ADDRESS_KEY, normalizedAddress);
+  return normalizedAddress;
+}
 
+function getStationAddress() {
+  return sessionStorage()?.getItem(STATION_ADDRESS_KEY) || "";
+}
+
+function getAccessPointAddress() {
+  return (
+    sessionStorage()?.getItem(AP_ADDRESS_KEY) ||
+    normalizeESP32Address(DEFAULT_AP_ADDRESS)
+  );
+}
+
+function ensureBrowserCanReach(address) {
+  const target = new URL(address);
   if (
     typeof window !== "undefined" &&
     window.location?.protocol === "https:" &&
-    parsedDeviceUrl.protocol === "http:"
+    target.protocol === "http:"
   ) {
     throw new Error(
-      "This dashboard is loaded over HTTPS, so the browser blocks requests to the ESP32 over HTTP. Open the dashboard over HTTP on the same network or use an HTTPS proxy for the ESP32.",
+      "This dashboard is loaded over HTTPS, so the browser blocks requests to the ESP32 over HTTP. Open the dashboard at http://localhost:5173 on a network that can reach the board, or use an HTTPS reverse proxy or secure relay.",
     );
   }
+}
 
+async function requestAt(address, path, options = {}) {
+  ensureBrowserCanReach(address);
   const controller = new AbortController();
-  const timeoutId = setTimeout(
-    () => controller.abort(),
-    REQUEST_TIMEOUT_MS,
-  );
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response;
 
   try {
-    response = await fetch(`${deviceUrl}${path}`, {
+    response = await fetch(`${address}${path}`, {
       ...options,
       signal: controller.signal,
       headers: {
@@ -79,12 +94,12 @@ async function request(path, options = {}) {
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(
-        `Cannot reach the ESP32 at ${deviceUrl}. Check the address and network access.`,
+        `Cannot reach the ESP32 at ${address}. Check the connected Wi-Fi network and device address.`,
         { cause: error },
       );
     }
     if (error.name === "AbortError") {
-      throw new Error(`The ESP32 at ${deviceUrl} did not respond in time.`, {
+      throw new Error(`The ESP32 at ${address} did not respond within 2.5 seconds.`, {
         cause: error,
       });
     }
@@ -95,11 +110,13 @@ async function request(path, options = {}) {
 
   const responseText = await response.text();
   let data = null;
-
   if (responseText) {
     try {
       data = JSON.parse(responseText);
-    } catch {
+    } catch (error) {
+      if (response.headers.get("content-type")?.includes("application/json")) {
+        throw new Error("The ESP32 returned invalid JSON.", { cause: error });
+      }
       data = responseText;
     }
   }
@@ -117,44 +134,125 @@ async function request(path, options = {}) {
   return data;
 }
 
-export async function getStatus() {
-  const status = await request("/status", { method: "GET" });
-
+function validateStatus(status) {
   if (
     typeof status !== "object" ||
     status === null ||
-    typeof status.connected !== "boolean"
+    typeof status.connected !== "boolean" ||
+    typeof status.connecting !== "boolean"
   ) {
     throw new Error("The ESP32 returned an invalid Wi-Fi status response.");
   }
-
   return status;
 }
 
-export function connectWiFi(ssid, password) {
-  return request("/connect", {
+function discoveryCandidates() {
+  const candidates = [
+    getESP32Address(),
+    getAccessPointAddress(),
+    getStationAddress(),
+  ].filter(Boolean);
+  return [...new Set(candidates)];
+}
+
+export async function discoverESP32() {
+  const failures = [];
+
+  for (const address of discoveryCandidates()) {
+    try {
+      const status = validateStatus(
+        await requestAt(address, "/status", { method: "GET" }),
+      );
+      const storage = sessionStorage();
+      const isAccessPointAddress =
+        address === getAccessPointAddress() ||
+        address === normalizeESP32Address(DEFAULT_AP_ADDRESS);
+      const accessPointAddress = status.apIp
+        ? normalizeESP32Address(status.apIp)
+        : "";
+
+      if (accessPointAddress) {
+        storage?.setItem(AP_ADDRESS_KEY, accessPointAddress);
+      }
+
+      if (status.connected && status.ip) {
+        const stationAddress = normalizeESP32Address(status.ip);
+        storage?.setItem(STATION_ADDRESS_KEY, stationAddress);
+        if (!isAccessPointAddress) {
+          setESP32Address(stationAddress);
+        }
+      }
+
+      return { ...status, reachableAddress: address };
+    } catch (error) {
+      failures.push(error.message);
+    }
+  }
+
+  if (failures.length === 1) {
+    throw new Error(failures[0]);
+  }
+
+  throw new Error(
+    `Could not discover the ESP32 at the setup access point or its last reported Wi-Fi address. Connect to the SmartNoticeBoard access point (192.168.4.1) or return to the same Wi-Fi network as the ESP32. ${failures.at(-1) || ""}`.trim(),
+  );
+}
+
+export async function getStatus() {
+  return discoverESP32();
+}
+
+export async function connectWiFi(ssid, password) {
+  if (typeof ssid !== "string" || !ssid.trim()) {
+    throw new Error("Enter a Wi-Fi network name.");
+  }
+  if (ssid.length > 32) {
+    throw new Error("Wi-Fi network names can be at most 32 characters.");
+  }
+  if (
+    typeof password !== "string" ||
+    (password.length > 0 && (password.length < 8 || password.length > 63))
+  ) {
+    throw new Error(
+      "Use a Wi-Fi password between 8 and 63 characters, or leave it empty for an open network.",
+    );
+  }
+
+  const discovery = await discoverESP32();
+  return requestAt(discovery.reachableAddress, "/connect", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ssid, password }),
   });
 }
 
-export function disconnectWiFi() {
-  return request("/disconnect", { method: "POST" });
+export async function disconnectWiFi() {
+  const discovery = await discoverESP32();
+  return requestAt(discovery.reachableAddress, "/disconnect", { method: "POST" });
 }
 
-export function reconnectWiFi() {
-  return request("/reconnect", { method: "POST" });
+export async function reconnectWiFi() {
+  const discovery = await discoverESP32();
+  return requestAt(discovery.reachableAddress, "/reconnect", { method: "POST" });
 }
 
-export function sendNotice(notice) {
-  return request("/notice", {
+export async function sendNotice(notice) {
+  if (typeof notice !== "string" || !notice.trim()) {
+    throw new Error("Enter a notice before sending.");
+  }
+  if (notice.length > MAX_NOTICE_LENGTH) {
+    throw new Error("Notices cannot exceed 200 characters.");
+  }
+
+  const discovery = await discoverESP32();
+  return requestAt(discovery.reachableAddress, "/notice", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ notice }),
   });
 }
 
-export function checkESP32() {
-  return request("/", { method: "GET" });
+export async function checkESP32() {
+  const discovery = await discoverESP32();
+  return requestAt(discovery.reachableAddress, "/", { method: "GET" });
 }

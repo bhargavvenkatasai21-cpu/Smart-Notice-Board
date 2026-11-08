@@ -13,6 +13,7 @@ function WiFiSettings({
   onDisconnect,
   onReconnect,
   onSaveDeviceAddress,
+  onDiscoverDevice,
 }) {
   const [ssid, setSsid] = useState("");
   const [password, setPassword] = useState("");
@@ -81,6 +82,14 @@ function WiFiSettings({
     );
   };
 
+  const handleDiscover = () => {
+    void runAction(
+      "discover",
+      onDiscoverDevice,
+      "ESP32 status refreshed.",
+    );
+  };
+
   const status = statusError
     ? "unreachable"
     : !statusLoaded
@@ -105,6 +114,33 @@ function WiFiSettings({
         </div>
       </section>
 
+      <section className="provisioning-guide" aria-labelledby="provisioning-title">
+        <div>
+          <p className="eyebrow">FIRST-TIME SETUP</p>
+          <h3 id="provisioning-title">Connect through the board’s setup access point</h3>
+          <ol>
+            <li>Connect this computer or phone to <strong>SmartNoticeBoard</strong> (password <strong>12345678</strong>).</li>
+            <li>Keep this dashboard open at <code>http://localhost:5173</code>, then enter your router’s Wi-Fi details below.</li>
+            <li>After the board reports its router IP, switch this device back to that router’s Wi-Fi. The dashboard will try the reported IP automatically.</li>
+          </ol>
+          <p>
+            The browser cannot switch networks for you. Router client isolation or a guest network may block access to the board even when Wi-Fi says connected.
+          </p>
+        </div>
+        <button
+          className="outline-button"
+          disabled={Boolean(busyAction)}
+          onClick={handleDiscover}
+          type="button"
+        >
+          {busyAction === "discover" ? (
+            <LoadingSpinner compact label="Searching known addresses…" />
+          ) : (
+            "Discover / refresh device"
+          )}
+        </button>
+      </section>
+
       <div className="wifi-grid">
         <section className="card config-card">
           <div className="card-heading">
@@ -116,7 +152,7 @@ function WiFiSettings({
           </div>
 
           <form className="device-address-form" onSubmit={handleDeviceAddressSubmit}>
-            <label htmlFor="device-address">ESP32 address (IP or host name)</label>
+            <label htmlFor="device-address">ESP32 address (advanced override)</label>
             <input
               autoComplete="url"
               id="device-address"
@@ -169,9 +205,15 @@ function WiFiSettings({
               </button>
             </div>
 
-            <button className="primary-button" disabled={Boolean(busyAction)} type="submit">
+            <button
+              className="primary-button"
+              disabled={Boolean(busyAction) || wifiStatus.connecting}
+              type="submit"
+            >
               {busyAction === "connect" ? (
                 <LoadingSpinner compact label="Connecting…" />
+              ) : wifiStatus.connecting ? (
+                "Connection in progress"
               ) : (
                 "Connect to Wi-Fi"
               )}
@@ -202,7 +244,7 @@ function WiFiSettings({
 
           <div className="connection-summary">
             <StatusBadge status={status} />
-            <span className="poll-note">Refreshes every 4 seconds</span>
+            <span className="poll-note">Automatically rediscovers device address</span>
           </div>
 
           <dl className="device-details">
@@ -220,7 +262,17 @@ function WiFiSettings({
                 <dd>{wifiStatus.apIp}</dd>
               </div>
             )}
+              <div>
+                <dt>Saved router credentials</dt>
+                <dd>{wifiStatus.savedCredentials ? "Saved on board" : "Not saved"}</dd>
+              </div>
           </dl>
+          {wifiStatus.connectionError &&
+            connectionFeedback?.message !== wifiStatus.connectionError && (
+              <p className="feedback error" role="alert">
+                {wifiStatus.connectionError}
+              </p>
+          )}
 
           <div className="action-row">
             <button
@@ -249,7 +301,7 @@ function WiFiSettings({
             </button>
             <button
               className="outline-button"
-              disabled={Boolean(busyAction)}
+              disabled={Boolean(busyAction) || wifiStatus.connecting}
               onClick={() =>
                 void runAction(
                   "reconnect",

@@ -8,6 +8,7 @@ function SendNotice({
   wifiStatus,
   statusError,
   statusLoaded,
+  connectionFeedback,
   deviceAddress,
   refreshStatus,
   onNavigate,
@@ -74,6 +75,12 @@ function SendNotice({
           <strong>{wifiStatus.ip || deviceAddress}</strong>
         </div>
       </section>
+
+      {connectionFeedback && (
+        <p className={`feedback ${connectionFeedback.kind}`} role="status">
+          {connectionFeedback.message}
+        </p>
+      )}
 
       <section className="card notice-card">
         <div className="card-heading">
