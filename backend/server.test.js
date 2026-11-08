@@ -4,14 +4,15 @@ const WebSocket = require("ws");
 
 process.env.PORT = "0";
 process.env.ESP32_DEVICE_TOKEN = "test-device-token";
-process.env.DASHBOARD_API_TOKEN = "test-dashboard-token";
+process.env.DASHBOARD_ACCESS_CODE = "test-access-code";
 process.env.DASHBOARD_ORIGIN =
     "http://localhost:5173,https://dashboard.example.test";
 process.env.NOTICE_ACK_TIMEOUT_MS = "300";
 
 const { server } = require("./server");
 const DEVICE_TOKEN = process.env.ESP32_DEVICE_TOKEN;
-const DASHBOARD_TOKEN = process.env.DASHBOARD_API_TOKEN;
+const DASHBOARD_ACCESS_CODE = process.env.DASHBOARD_ACCESS_CODE;
+let DASHBOARD_TOKEN = "";
 let baseUrl;
 let deviceSocket;
 
@@ -52,6 +53,14 @@ async function connectDevice() {
 before(async () => {
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessCode: DASHBOARD_ACCESS_CODE })
+    });
+    const session = await response.json();
+    assert.equal(response.status, 200);
+    DASHBOARD_TOKEN = session.sessionToken;
 });
 
 after(async () => {
@@ -78,12 +87,47 @@ test("health endpoint is public and reports WebSocket connectivity", async () =>
     });
 });
 
+test("dashboard access code creates a session and rejects incorrect or empty codes", async () => {
+    const emptyResponse = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessCode: "  " })
+    });
+    assert.equal(emptyResponse.status, 400);
+    assert.equal((await emptyResponse.json()).message, "Enter the dashboard access code.");
+
+    const invalidResponse = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessCode: "incorrect-code" })
+    });
+    assert.equal(invalidResponse.status, 401);
+    assert.equal((await invalidResponse.json()).message, "Incorrect dashboard access code.");
+
+    const loginResponse = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessCode: DASHBOARD_ACCESS_CODE, rememberMe: true })
+    });
+    const session = await loginResponse.json();
+    assert.equal(loginResponse.status, 200);
+    assert.equal(session.success, true);
+    assert.equal(typeof session.sessionToken, "string");
+    assert.equal(session.sessionToken.length, 64);
+    assert.equal(typeof session.expiresAt, "string");
+
+    const statusResponse = await fetch(`${baseUrl}/api/device/status`, {
+        headers: { Authorization: `Bearer ${session.sessionToken}` }
+    });
+    assert.equal(statusResponse.status, 200);
+});
+
 test("device status and notice routes require dashboard authentication", async () => {
     const response = await fetch(`${baseUrl}/api/device/status`);
     assert.equal(response.status, 401);
     assert.deepEqual(await response.json(), {
         success: false,
-        message: "Unauthorized"
+        message: "Dashboard session is invalid or expired."
     });
 
     const invalidToken = await fetch(`${baseUrl}/api/notices`, {
@@ -257,4 +301,25 @@ test("notice delivery fails instead of reporting success without ESP32 acknowled
     socket.close();
     await new Promise((resolve) => socket.once("close", resolve));
     deviceSocket = null;
+});
+
+test("logout revokes the dashboard session", async () => {
+    const loginResponse = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessCode: DASHBOARD_ACCESS_CODE })
+    });
+    const session = await loginResponse.json();
+
+    const logoutResponse = await fetch(`${baseUrl}/api/auth/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.sessionToken}` }
+    });
+    assert.equal(logoutResponse.status, 200);
+    assert.deepEqual(await logoutResponse.json(), { success: true });
+
+    const statusResponse = await fetch(`${baseUrl}/api/device/status`, {
+        headers: { Authorization: `Bearer ${session.sessionToken}` }
+    });
+    assert.equal(statusResponse.status, 401);
 });

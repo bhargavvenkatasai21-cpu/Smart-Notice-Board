@@ -181,6 +181,30 @@
   margin-bottom: 16px;
 }
 
+.access-card .remember-token-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 6px;
+  color: #34445f;
+  cursor: pointer;
+}
+
+.access-card .remember-token-option input {
+  width: 16px;
+  min-height: 16px;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: #245cbe;
+}
+
+.remember-token-warning {
+  margin: 0 0 17px;
+  color: #78869a;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .access-card .primary-button {
   width: 100%;
 }

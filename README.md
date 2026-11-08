@@ -25,20 +25,30 @@ Configure these backend environment variables in the local environment or
 Render service settings:
 
 - `ESP32_DEVICE_TOKEN`: shared only by the backend and ESP32 firmware.
-- `DASHBOARD_API_TOKEN`: dashboard API bearer token.
+- `DASHBOARD_ACCESS_CODE`: code entered on the dashboard login form. The
+  backend validates it and issues an opaque dashboard session; the access code
+  is never included in the frontend bundle.
 - `DASHBOARD_ORIGIN`: exact dashboard origin(s), comma-separated (include the
   deployed Render Static Site origin and any local development origin).
 - `PORT`: optional; Render assigns this automatically.
 - `NOTICE_ACK_TIMEOUT_MS`: optional acknowledgment timeout; defaults to 10000.
 
-Keep actual tokens in untracked environment settings. Do not place credentials
-in a `VITE_*` variable: Vite embeds those values in publicly downloadable
-JavaScript. The dashboard prompts for the shared dashboard token and keeps it
-in memory only. This avoids bundling or persisting it but is still a shared
-credential model; it does not provide per-user identity, revocation, or
-individual audit trails. For a public production dashboard, replace it with
-individual user authentication (for example, an OIDC provider and short-lived
-server-side sessions) before granting access to multiple users.
+Keep the access code and device token in untracked backend environment
+settings. Do not place credentials in a `VITE_*` variable: Vite embeds those
+values in publicly downloadable JavaScript. The dashboard exchanges the code
+for an opaque server-side session. Sessions expire after 12 hours by default
+or 30 days when “Remember me” is selected; logout revokes the current session.
+Remember me stores only the session token in `localStorage`, not the access
+code. JavaScript running on the dashboard origin can read local storage, so
+avoid shared devices and protect the site against cross-site scripting.
+
+The configured access code is short and guessable. Backend validation keeps
+it out of the frontend bundle, but does not make the code itself strong; use
+this shared code only for a trusted/demo deployment. For internet-facing or
+multi-user access, use a long random code or individual authentication.
+Sessions are held in backend memory and are invalidated when the backend
+restarts or is redeployed; this in-memory session store is not shared across
+multiple backend instances.
 
 ## Run locally
 
@@ -86,19 +96,21 @@ connectivity on the actual hardware.
 ## Deploy
 
 1. Deploy `backend/` as a Render Web Service with `npm install` and `npm start`.
-2. Set `ESP32_DEVICE_TOKEN`, `DASHBOARD_API_TOKEN`, and `DASHBOARD_ORIGIN` in
+2. Set `ESP32_DEVICE_TOKEN`, `DASHBOARD_ACCESS_CODE`, and `DASHBOARD_ORIGIN` in
    the backend's Render environment. Set `DASHBOARD_ORIGIN` to the exact
-   deployed Static Site origin.
+   deployed Static Site origin. Set `DASHBOARD_ACCESS_CODE` to the required
+   access code in Render's backend environment settings; do not add it to the
+   frontend service.
 3. Configure the dashboard Static Site with root directory
    `smart-notice-dashboard`, build command `npm install && npm run build`, and
    publish directory `dist`.
 4. Set `VITE_API_BASE_URL=https://smart-notice-board-api.onrender.com` for the
-   Static Site, then redeploy. Do not configure a dashboard token as a
+   Static Site, then redeploy. Do not configure the dashboard access code as a
    `VITE_*` variable.
 5. Flash the firmware with its private device token configured in the ignored
    `include/secrets.h` file and verify its secure WebSocket authentication.
-6. Sign in to the dashboard with `DASHBOARD_API_TOKEN`, then check backend,
-   device, and WebSocket status before sending a notice.
+6. Sign in to the dashboard with the configured access code, then check
+   backend, device, and WebSocket status before sending a notice.
 
 The backend reports a notice as delivered only after the ESP32 acknowledges
 processing its display command. The acknowledgment confirms the firmware ran

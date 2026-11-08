@@ -41,8 +41,10 @@ provided and the behavior still needs physical verification.
 | PlatformIO dependencies | PASS | Resolved `LiquidCrystal 1.0.7`, `ArduinoJson 7.4.3`, `WebSockets 2.7.3`, `Preferences`, `WebServer`, and `WiFi`. |
 | Dashboard production build | PASS | `npm run build`; Vite 8.3.6. |
 | Dashboard lint | PASS | `npm run lint`; no errors or warnings. |
-| Dashboard tests | PASS | `npm test`; all 41 tests passed across 4 files, including authenticated backend routing, notice validation/acknowledgment handling, setup gating, and loading/error states. |
-| Backend integration tests | PASS | `npm test`; all 9 tests passed, including health, CORS, token authentication, malformed/invalid requests, offline device, WebSocket auth, successful acknowledgment, 200-character notice, and acknowledgment timeout. Uses a simulated WebSocket device. |
+| Dashboard tests | PASS | `npm test`; 53 tests passed across 4 files. Covers access-code login, empty input, Remember me session storage/restoration, invalid-session cleanup, legacy-token removal, logout, backend routing, notice validation/delivery, and local Wi-Fi provisioning. |
+| Backend integration tests | PASS | `npm test`; 11 tests passed, including access-code authentication, session revocation, protected status/notices, malformed requests, offline device, unchanged ESP32 WebSocket auth, successful acknowledgment, 200-character notice, and acknowledgment timeout. Uses a simulated WebSocket device. |
+| Deployed Render health check | PASS | Unauthenticated `GET /api/health` returned `status: OK` and `websocketConnected: true` at test time. Authenticated production routes were not called. |
+| Local configured access-code smoke check | PASS | Using the ignored backend `.env`, login returned HTTP 200, authenticated device status returned 200, logout returned 200, and the revoked session then received 401. The configured code was not printed. |
 | Firmware logic unit tests | NOT AVAILABLE | The project has no host-side firmware unit-test harness. Scroll boundaries and Wi-Fi transitions still need board-level verification. |
 | Browser/device integration check | NOT TESTED | No physical ESP32, LCD, or project Wi-Fi network was accessible. Backend integration used a simulated WebSocket device; no live board/LCD delivery was performed. |
 
@@ -66,11 +68,16 @@ provided and the behavior still needs physical verification.
   development dashboard to avoid mixed-content requests.
 - The backend allows configured dashboard origins from `DASHBOARD_ORIGIN`.
   Render must be configured with the exact deployed Static Site origin.
-- The dashboard token is entered by the operator and held in memory; it is not
-  embedded in `VITE_*` build variables or stored in browser storage. The
-  backend still uses one shared bearer token, so it does not provide
-  per-user identity, revocation, or audit history. Use individual user
-  authentication and short-lived sessions before granting broad public access.
+- The dashboard access code is checked only by the backend and exchanged for
+  an opaque session token; the code is not embedded in `VITE_*` variables.
+  Sessions expire after 12 hours, or 30 days when Remember me is selected.
+  Remember me stores the session token, not the code, in localStorage; scripts
+  on the same origin can still read it, so shared-device and XSS risks remain.
+  Sessions are held in memory and are invalidated on backend restart. The
+  configured shared code is short and guessable, so this is not appropriate
+  for sensitive or broad public access; use individual authentication and
+  stronger credentials for production use. The in-memory sessions are not
+  shared across backend instances.
 - The backend sends a notice over the authenticated WebSocket and waits for a
   matching `NOTICE_ACK`. It returns success only after firmware acknowledges
   the display routine. The acknowledgment does not prove that the LCD hardware

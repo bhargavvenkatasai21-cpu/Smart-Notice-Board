@@ -77,7 +77,7 @@ function getBackendUrl() {
   }
 }
 
-async function requestBackend(path, { token, ...options } = {}) {
+async function requestBackend(path, { sessionToken, ...options } = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(
     () => controller.abort(),
@@ -87,8 +87,8 @@ async function requestBackend(path, { token, ...options } = {}) {
     Accept: "application/json",
     ...options.headers,
   };
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
+  if (sessionToken) {
+    headers.Authorization = `Bearer ${sessionToken}`;
   }
 
   let response;
@@ -130,7 +130,9 @@ async function requestBackend(path, { token, ...options } = {}) {
       typeof data?.message === "string"
         ? data.message
         : `Backend request failed with HTTP ${response.status}.`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
 
   return data;
@@ -144,13 +146,46 @@ export async function getBackendHealth() {
   return health;
 }
 
-export async function getDeviceStatus(token) {
-  if (typeof token !== "string" || !token.trim()) {
-    throw new Error("Enter the dashboard access token.");
+export async function createDashboardSession(accessCode, rememberMe = false) {
+  if (typeof accessCode !== "string" || !accessCode.trim()) {
+    throw new Error("Enter the dashboard access code.");
+  }
+  const session = await requestBackend("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ accessCode: accessCode.trim(), rememberMe }),
+  });
+  if (
+    session?.success !== true ||
+    typeof session.sessionToken !== "string" ||
+    !session.sessionToken
+  ) {
+    throw new Error("The backend did not create a valid dashboard session.");
+  }
+  return session;
+}
+
+export async function logoutDashboardSession(sessionToken) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
+    throw new Error("A dashboard session is required to sign out.");
+  }
+  const result = await requestBackend("/api/auth/logout", {
+    method: "POST",
+    sessionToken,
+  });
+  if (result?.success !== true) {
+    throw new Error("The backend did not confirm the dashboard sign-out.");
+  }
+  return result;
+}
+
+export async function getDeviceStatus(sessionToken) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
+    throw new Error("Sign in with the dashboard access code first.");
   }
   const status = await requestBackend("/api/device/status", {
     method: "GET",
-    token,
+    sessionToken,
   });
   if (typeof status?.connected !== "boolean") {
     throw new Error("The backend returned an invalid device status response.");
@@ -356,20 +391,20 @@ export async function reconnectWiFi() {
   return requestAt(discovery.reachableAddress, "/reconnect", { method: "POST" });
 }
 
-export async function sendNotice(notice, token) {
+export async function sendNotice(notice, sessionToken) {
   if (typeof notice !== "string" || !notice.trim()) {
     throw new Error("Enter a notice before sending.");
   }
   if (notice.length > MAX_NOTICE_LENGTH) {
     throw new Error("Notices cannot exceed 200 characters.");
   }
-  if (typeof token !== "string" || !token.trim()) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
     throw new Error("Sign in before sending a notice.");
   }
 
   const result = await requestBackend("/api/notices", {
     method: "POST",
-    token,
+    sessionToken,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ notice: notice.trim() }),
   });

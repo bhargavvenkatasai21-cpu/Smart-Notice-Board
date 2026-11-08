@@ -11,16 +11,18 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || 5000;
 const DEVICE_TOKEN = process.env.ESP32_DEVICE_TOKEN;
-const DASHBOARD_TOKEN = process.env.DASHBOARD_API_TOKEN;
+const DASHBOARD_ACCESS_CODE = process.env.DASHBOARD_ACCESS_CODE;
 const MAX_NOTICE_LENGTH = 200;
 const NOTICE_ACK_TIMEOUT_MS = Number(process.env.NOTICE_ACK_TIMEOUT_MS) || 10000;
+const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const REMEMBERED_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DASHBOARD_ORIGINS = (process.env.DASHBOARD_ORIGIN || "http://localhost:5173")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-if (!DEVICE_TOKEN || !DASHBOARD_TOKEN) {
-    throw new Error("Missing authentication tokens in .env");
+if (!DEVICE_TOKEN || !DASHBOARD_ACCESS_CODE) {
+    throw new Error("Missing ESP32_DEVICE_TOKEN or DASHBOARD_ACCESS_CODE in .env");
 }
 
 app.use(cors({
@@ -42,22 +44,69 @@ function verifyToken(provided, expected) {
         crypto.timingSafeEqual(a, b);
 }
 
+const dashboardSessions = new Map();
+
+function hashSessionToken(token) {
+    return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function createDashboardSession(rememberMe) {
+    const sessionToken = crypto.randomBytes(32).toString("hex");
+    const now = Date.now();
+    for (const [sessionKey, sessionExpiry] of dashboardSessions) {
+        if (sessionExpiry <= now) dashboardSessions.delete(sessionKey);
+    }
+    const expiresAt = now +
+        (rememberMe ? REMEMBERED_SESSION_TTL_MS : DASHBOARD_SESSION_TTL_MS);
+    dashboardSessions.set(hashSessionToken(sessionToken), expiresAt);
+    return { sessionToken, expiresAt: new Date(expiresAt).toISOString() };
+}
+
 // Dashboard authentication
 function authenticateDashboard(req, res, next) {
     const authorization = req.headers.authorization || "";
-    const token = authorization.startsWith("Bearer ")
+    const sessionToken = authorization.startsWith("Bearer ")
         ? authorization.slice(7)
         : "";
+    const sessionKey = sessionToken ? hashSessionToken(sessionToken) : "";
+    const expiresAt = dashboardSessions.get(sessionKey);
 
-    if (!verifyToken(token, DASHBOARD_TOKEN)) {
+    if (!expiresAt || expiresAt <= Date.now()) {
+        if (sessionKey) dashboardSessions.delete(sessionKey);
         return res.status(401).json({
             success: false,
-            message: "Unauthorized"
+            message: "Dashboard session is invalid or expired."
         });
     }
 
+    req.dashboardSessionKey = sessionKey;
     next();
 }
+
+app.post("/api/auth/login", (req, res) => {
+    const accessCode = req.body?.accessCode;
+    if (typeof accessCode !== "string" || !accessCode.trim()) {
+        return res.status(400).json({
+            success: false,
+            message: "Enter the dashboard access code."
+        });
+    }
+
+    if (!verifyToken(accessCode, DASHBOARD_ACCESS_CODE)) {
+        return res.status(401).json({
+            success: false,
+            message: "Incorrect dashboard access code."
+        });
+    }
+
+    const session = createDashboardSession(req.body?.rememberMe === true);
+    return res.json({ success: true, ...session });
+});
+
+app.post("/api/auth/logout", authenticateDashboard, (req, res) => {
+    dashboardSessions.delete(req.dashboardSessionKey);
+    return res.json({ success: true });
+});
 
 // Health check
 app.get("/", (req, res) => {

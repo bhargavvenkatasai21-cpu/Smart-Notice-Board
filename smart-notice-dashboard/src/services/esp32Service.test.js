@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   connectWiFi,
+  createDashboardSession,
   discoverESP32,
   disconnectWiFi,
   getBackendHealth,
   getDeviceStatus,
   getESP32Address,
   getStatus,
+  logoutDashboardSession,
   normalizeESP32Address,
   reconnectWiFi,
   sendNotice,
@@ -256,6 +258,49 @@ describe("Wi-Fi actions", () => {
 });
 
 describe("status and notice API", () => {
+  it("exchanges the access code for a backend session", async () => {
+    const session = {
+      success: true,
+      sessionToken: "opaque-session-token",
+      expiresAt: "2026-11-09T00:00:00.000Z",
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(session));
+
+    await expect(createDashboardSession("access-code", true)).resolves.toEqual(session);
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/auth/login`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ accessCode: "access-code", rememberMe: true }),
+      }),
+    );
+  });
+
+  it("rejects an empty access code without a backend request", async () => {
+    await expect(createDashboardSession("  ")).rejects.toThrow(
+      /Enter the dashboard access code/,
+    );
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("revokes the backend session on logout", async () => {
+    globalThis.fetch = vi.fn(async () => jsonResponse({ success: true }));
+
+    await expect(logoutDashboardSession("session-token")).resolves.toEqual({
+      success: true,
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/auth/logout`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: "Bearer session-token",
+        }),
+      }),
+    );
+  });
+
   it("checks backend health independently from device connectivity", async () => {
     globalThis.fetch = vi.fn(async (url) =>
       url === `${BACKEND}/api/health`
@@ -264,7 +309,7 @@ describe("status and notice API", () => {
     );
 
     await expect(getBackendHealth()).resolves.toMatchObject({ status: "OK" });
-    await expect(getDeviceStatus("dashboard-token")).resolves.toMatchObject({
+    await expect(getDeviceStatus("session-token")).resolves.toMatchObject({
       connected: false,
     });
     expect(fetch.mock.calls.map(([url]) => url)).toEqual([
@@ -272,8 +317,19 @@ describe("status and notice API", () => {
       `${BACKEND}/api/device/status`,
     ]);
     expect(fetch.mock.calls[1][1].headers.Authorization).toBe(
-      "Bearer dashboard-token",
+      "Bearer session-token",
     );
+  });
+
+  it("preserves HTTP 401 status for invalid or expired dashboard sessions", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ success: false, message: "Unauthorized" }, 401),
+    );
+
+    await expect(getDeviceStatus("stale-session")).rejects.toMatchObject({
+      message: "Unauthorized",
+      status: 401,
+    });
   });
 
   it.each([
@@ -305,7 +361,7 @@ describe("status and notice API", () => {
     globalThis.fetch = vi.fn(async () =>
       jsonResponse({ message: `server error ${code}` }, code),
     );
-    await expect(sendNotice("Meeting", "dashboard-token")).rejects.toThrow(
+    await expect(sendNotice("Meeting", "session-token")).rejects.toThrow(
       `server error ${code}`,
     );
   });
@@ -318,7 +374,7 @@ describe("status and notice API", () => {
     };
     globalThis.fetch = vi.fn(async () => jsonResponse(result));
 
-    await expect(sendNotice(" Meeting at 10 ", "dashboard-token")).resolves.toEqual(
+    await expect(sendNotice(" Meeting at 10 ", "session-token")).resolves.toEqual(
       result,
     );
     expect(fetch).toHaveBeenCalledWith(
@@ -326,7 +382,7 @@ describe("status and notice API", () => {
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({
-          Authorization: "Bearer dashboard-token",
+          Authorization: "Bearer session-token",
           "Content-Type": "application/json",
         }),
         body: JSON.stringify({ notice: "Meeting at 10" }),
@@ -338,7 +394,7 @@ describe("status and notice API", () => {
     globalThis.fetch = vi.fn(async () =>
       jsonResponse({ success: true, message: "Notice queued" }),
     );
-    await expect(sendNotice("Meeting", "dashboard-token")).rejects.toThrow(
+    await expect(sendNotice("Meeting", "session-token")).rejects.toThrow(
       /Notice queued/,
     );
   });
@@ -348,18 +404,18 @@ describe("status and notice API", () => {
       jsonResponse({ success: true, delivered: true, message: "Acknowledged" }),
     );
     const notice = "x".repeat(200);
-    await expect(sendNotice(notice, "dashboard-token")).resolves.toMatchObject({
+    await expect(sendNotice(notice, "session-token")).resolves.toMatchObject({
       delivered: true,
     });
     expect(JSON.parse(fetch.mock.calls[0][1].body).notice).toHaveLength(200);
   });
 
   it("rejects empty, overlength, and unauthenticated notices without a request", async () => {
-    await expect(sendNotice("  ", "dashboard-token")).rejects.toThrow(
+    await expect(sendNotice("  ", "session-token")).rejects.toThrow(
       /Enter a notice/,
     );
     await expect(
-      sendNotice("x".repeat(201), "dashboard-token"),
+      sendNotice("x".repeat(201), "session-token"),
     ).rejects.toThrow(/cannot exceed 200/);
     await expect(sendNotice("Meeting", "")).rejects.toThrow(/Sign in/);
     expect(fetch).not.toHaveBeenCalled();
