@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ctype.h>
+#include <string.h>
 #include <LiquidCrystal.h>
 #include <Preferences.h>
 #include <WebServer.h>
@@ -32,6 +34,7 @@ namespace
     WebSocketsClient webSocket;
 
     void displayNewNotice(const String &newNotice);
+    void beginConnection(const String &ssid, const String &password);
 
     bool webSocketStarted = false;
     Preferences preferences;
@@ -51,6 +54,20 @@ namespace
     volatile bool stationGotIpEvent = false;
     volatile bool stationDisconnectedEvent = false;
     volatile uint8_t stationDisconnectReason = 0;
+    bool webSocketAuthenticated = false;
+    bool credentialCandidatePending = false;
+    bool remoteWifiConfigurationActive = false;
+    bool remoteWifiTargetConnected = false;
+    bool remoteWifiConfigurationFailed = false;
+    unsigned long remoteWifiConnectedAt = 0;
+    String credentialCandidateSsid;
+    String credentialCandidatePassword;
+    String remoteWifiRequestId;
+    String remoteWifiPreviousSsid;
+    String remoteWifiPreviousPassword;
+    String remoteWifiFailureMessage;
+
+    constexpr unsigned long kBackendReconnectTimeoutMs = 60000;
 
     enum class CredentialLoadResult
     {
@@ -171,12 +188,118 @@ namespace
             return CredentialLoadResult::StorageError;
         }
 
-        ssid = preferences.getString("ssid", "");
-        password = preferences.getString("password", "");
+        if (preferences.isKey("activeSlot"))
+        {
+            const uint8_t activeSlot = preferences.getUChar("activeSlot", 0);
+            const char *ssidKey = activeSlot == 0 ? "ssid0" : "ssid1";
+            const char *passwordKey = activeSlot == 0 ? "password0" : "password1";
+            ssid = preferences.getString(ssidKey, "");
+            password = preferences.getString(passwordKey, "");
+        }
+        else
+        {
+            ssid = preferences.getString("ssid", "");
+            password = preferences.getString("password", "");
+        }
         preferences.end();
         return ssid.isEmpty()
                    ? CredentialLoadResult::Missing
                    : CredentialLoadResult::Loaded;
+    }
+
+    bool saveCredentials(const String &ssid, const String &password)
+    {
+        if (!preferences.begin(kPreferencesNamespace, false))
+        {
+            return false;
+        }
+
+        const bool hasActiveSlot = preferences.isKey("activeSlot");
+        const uint8_t activeSlot = preferences.getUChar("activeSlot", 1);
+        const uint8_t candidateSlot = hasActiveSlot ? 1 - activeSlot : 0;
+        const char *ssidKey = candidateSlot == 0 ? "ssid0" : "ssid1";
+        const char *passwordKey = candidateSlot == 0 ? "password0" : "password1";
+        const bool written =
+            preferences.putString(ssidKey, ssid) == ssid.length() &&
+            preferences.putString(passwordKey, password) == password.length() &&
+            preferences.getString(ssidKey, "") == ssid &&
+            preferences.getString(passwordKey, "") == password &&
+            preferences.putUChar("activeSlot", candidateSlot) == sizeof(uint8_t) &&
+            preferences.getUChar("activeSlot", 255) == candidateSlot;
+        preferences.end();
+        return written;
+    }
+
+    bool validRequestId(const char *requestId)
+    {
+        if (requestId == nullptr || strlen(requestId) != 36)
+        {
+            return false;
+        }
+
+        for (size_t index = 0; index < 36; ++index)
+        {
+            if (index == 8 || index == 13 || index == 18 || index == 23)
+            {
+                if (requestId[index] != '-')
+                {
+                    return false;
+                }
+            }
+            else if (!isxdigit(static_cast<unsigned char>(requestId[index])))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void sendWifiConfigurationStatus(
+        const String &requestId,
+        const char *state,
+        const String &ssid = "",
+        const String &ip = "")
+    {
+        if (!webSocketAuthenticated || requestId.isEmpty())
+        {
+            return;
+        }
+
+        JsonDocument document;
+        document["type"] = "WIFI_CONFIG_STATUS";
+        document["requestId"] = requestId;
+        document["state"] = state;
+        if (!ssid.isEmpty())
+        {
+            document["ssid"] = ssid;
+        }
+        if (!ip.isEmpty())
+        {
+            document["ip"] = ip;
+        }
+
+        String message;
+        serializeJson(document, message);
+        webSocket.sendTXT(message);
+    }
+
+    void startRemoteWifiRollback(const String &reason)
+    {
+        remoteWifiConfigurationFailed = true;
+        remoteWifiTargetConnected = false;
+        remoteWifiFailureMessage = reason;
+        credentialCandidatePending = false;
+        credentialCandidateSsid = "";
+        credentialCandidatePassword = "";
+        connectionError = reason;
+
+        if (!remoteWifiPreviousSsid.isEmpty())
+        {
+            beginConnection(
+                remoteWifiPreviousSsid,
+                remoteWifiPreviousPassword);
+            connectionError = reason;
+        }
     }
 
     void beginConnection(const String &ssid, const String &password)
@@ -205,7 +328,7 @@ namespace
 
     void handleConnect()
     {
-        if (connectionInProgress)
+        if (connectionInProgress || remoteWifiConfigurationActive)
         {
             sendMessage(409, "A WiFi connection attempt is already in progress");
             return;
@@ -230,12 +353,18 @@ namespace
             return;
         }
 
-        ssid = document["ssid"] | "";
-        password = document["password"] | "";
-        String trimmedSsid = ssid;
-        trimmedSsid.trim();
+        if (!document["ssid"].is<const char *>() ||
+            !document["password"].is<const char *>())
+        {
+            sendMessage(400, "WiFi name and password must be strings");
+            return;
+        }
 
-        if (trimmedSsid.isEmpty())
+        ssid = document["ssid"].as<String>();
+        password = document["password"].as<String>();
+        ssid.trim();
+
+        if (ssid.isEmpty())
         {
             sendMessage(400, "WiFi name is required");
             return;
@@ -254,34 +383,104 @@ namespace
             return;
         }
 
-        if (!preferences.begin(kPreferencesNamespace, false))
-        {
-            Serial.println("ERROR: Could not open WiFi preferences for writing");
-            sendMessage(500, "Could not save WiFi credentials");
-            return;
-        }
-
-        preferences.putString("ssid", ssid);
-        preferences.putString("password", password);
-        const bool saved =
-            preferences.getString("ssid", "") == ssid &&
-            preferences.getString("password", "") == password;
-        preferences.end();
-
-        if (!saved)
-        {
-            Serial.println("ERROR: WiFi credentials could not be verified in preferences");
-            sendMessage(500, "Could not save WiFi credentials");
-            return;
-        }
-
+        credentialCandidatePending = true;
+        credentialCandidateSsid = ssid;
+        credentialCandidatePassword = password;
         beginConnection(ssid, password);
-        sendMessage(202, "WiFi credentials saved; connection is in progress");
+        sendMessage(202, "WiFi connection is in progress; saved credentials remain unchanged until connected");
+    }
+
+    void handleRemoteWifiConfiguration(JsonDocument &document)
+    {
+        const char *requestId = document["requestId"];
+        if (!validRequestId(requestId))
+        {
+            return;
+        }
+
+        const String requestIdValue(requestId);
+        const auto reportFailure = [&requestIdValue]()
+        {
+            sendWifiConfigurationStatus(requestIdValue, "failed");
+        };
+
+        if (
+            !webSocketAuthenticated ||
+            connectionInProgress ||
+            remoteWifiConfigurationActive)
+        {
+            reportFailure();
+            return;
+        }
+
+        if (
+            !document["ssid"].is<const char *>() ||
+            !document["password"].is<const char *>())
+        {
+            reportFailure();
+            return;
+        }
+
+        String ssid = document["ssid"].as<String>();
+        const String password = document["password"].as<String>();
+        ssid.trim();
+        if (
+            ssid.isEmpty() ||
+            ssid.length() > 32 ||
+            (!password.isEmpty() &&
+                (password.length() < 8 || password.length() > 63)))
+        {
+            reportFailure();
+            return;
+        }
+
+        if (!connectedToTargetNetwork())
+        {
+            reportFailure();
+            return;
+        }
+
+        String previousSsid;
+        String previousPassword;
+        if (loadSavedCredentials(previousSsid, previousPassword) !=
+            CredentialLoadResult::Loaded)
+        {
+            reportFailure();
+            return;
+        }
+
+        remoteWifiRequestId = requestIdValue;
+        remoteWifiPreviousSsid = previousSsid;
+        remoteWifiPreviousPassword = previousPassword;
+        remoteWifiFailureMessage = "";
+        remoteWifiConfigurationActive = true;
+        remoteWifiTargetConnected = false;
+        remoteWifiConfigurationFailed = false;
+        credentialCandidatePending = true;
+        credentialCandidateSsid = ssid;
+        credentialCandidatePassword = password;
+
+        sendWifiConfigurationStatus(remoteWifiRequestId, "accepted");
+        sendWifiConfigurationStatus(remoteWifiRequestId, "connecting");
+        webSocketAuthenticated = false;
+        beginConnection(ssid, password);
+    }
+
+    void clearRemoteWifiConfiguration()
+    {
+        remoteWifiConfigurationActive = false;
+        remoteWifiTargetConnected = false;
+        remoteWifiConfigurationFailed = false;
+        remoteWifiConnectedAt = 0;
+        remoteWifiRequestId = "";
+        remoteWifiPreviousSsid = "";
+        remoteWifiPreviousPassword = "";
+        remoteWifiFailureMessage = "";
     }
 
     void handleReconnect()
     {
-        if (connectionInProgress)
+        if (connectionInProgress || remoteWifiConfigurationActive)
         {
             sendMessage(409, "A WiFi connection attempt is already in progress");
             return;
@@ -315,6 +514,12 @@ namespace
 
     void handleDisconnect()
     {
+        if (remoteWifiConfigurationActive)
+        {
+            sendMessage(409, "A remote WiFi configuration is already in progress");
+            return;
+        }
+
         reconnectEnabled = false;
         connectionInProgress = false;
         connectionError = "";
@@ -373,6 +578,7 @@ namespace
 
         case WStype_CONNECTED:
         {
+            webSocketAuthenticated = false;
             Serial.println("Connected to Render WebSocket");
 
             JsonDocument authDocument;
@@ -389,6 +595,7 @@ namespace
         }
 
         case WStype_DISCONNECTED:
+            webSocketAuthenticated = false;
             Serial.println("Disconnected from Render WebSocket");
             break;
 
@@ -409,7 +616,64 @@ namespace
 
             if (strcmp(messageType, "CONNECTION") == 0)
             {
+                webSocketAuthenticated = true;
                 Serial.println("ESP32 authenticated successfully");
+
+                JsonDocument statusDocument;
+                statusDocument["type"] = "DEVICE_STATUS";
+                statusDocument["connected"] = connectedToTargetNetwork();
+                statusDocument["ssid"] = connectedToTargetNetwork()
+                    ? WiFi.SSID()
+                    : "";
+                statusDocument["ip"] = connectedToTargetNetwork()
+                    ? WiFi.localIP().toString()
+                    : "";
+                String statusMessage;
+                serializeJson(statusDocument, statusMessage);
+                webSocket.sendTXT(statusMessage);
+
+                if (remoteWifiConfigurationActive)
+                {
+                    if (remoteWifiConfigurationFailed)
+                    {
+                        sendWifiConfigurationStatus(
+                            remoteWifiRequestId,
+                            "failed");
+                        clearRemoteWifiConfiguration();
+                    }
+                    else if (remoteWifiTargetConnected)
+                    {
+                        if (saveCredentials(
+                                credentialCandidateSsid,
+                                credentialCandidatePassword))
+                        {
+                            credentialCandidatePending = false;
+                            credentialCandidateSsid = "";
+                            credentialCandidatePassword = "";
+                            sendWifiConfigurationStatus(
+                                remoteWifiRequestId,
+                                "wifi_connected",
+                                WiFi.SSID(),
+                                WiFi.localIP().toString());
+                            sendWifiConfigurationStatus(
+                                remoteWifiRequestId,
+                                "authenticated",
+                                WiFi.SSID(),
+                                WiFi.localIP().toString());
+                            clearRemoteWifiConfiguration();
+                        }
+                        else
+                        {
+                            const String failure =
+                                "Wi-Fi connected but the new credentials could not be saved.";
+                            sendWifiConfigurationStatus(
+                                remoteWifiRequestId,
+                                "failed");
+                            startRemoteWifiRollback(failure);
+                            clearRemoteWifiConfiguration();
+                        }
+                    }
+                }
             }
 
             else if (strcmp(messageType, "NOTICE") == 0)
@@ -442,6 +706,11 @@ namespace
                 String acknowledgementMessage;
                 serializeJson(acknowledgement, acknowledgementMessage);
                 webSocket.sendTXT(acknowledgementMessage);
+            }
+
+            else if (strcmp(messageType, "WIFI_CONFIG") == 0)
+            {
+                handleRemoteWifiConfiguration(document);
             }
 
             break;
@@ -575,7 +844,10 @@ namespace
 
         if (connected)
         {
-            connectionError = "";
+            if (!remoteWifiConfigurationFailed)
+            {
+                connectionError = "";
+            }
 
             // Start secure WebSocket connection to Render
             if (!webSocketStarted)
@@ -604,8 +876,47 @@ namespace
                 Serial.print("WiFi SSID: ");
                 Serial.println(WiFi.SSID());
 
+                if (credentialCandidatePending)
+                {
+                    if (remoteWifiConfigurationActive)
+                    {
+                        if (connectionTargetSsid == credentialCandidateSsid)
+                        {
+                            remoteWifiTargetConnected = true;
+                            remoteWifiConnectedAt = now;
+                        }
+                    }
+                    else
+                    {
+                        if (saveCredentials(
+                                credentialCandidateSsid,
+                                credentialCandidatePassword))
+                        {
+                            connectionError = "";
+                        }
+                        else
+                        {
+                            connectionError =
+                                "WiFi connected, but credentials could not be saved.";
+                        }
+                        credentialCandidatePending = false;
+                        credentialCandidateSsid = "";
+                        credentialCandidatePassword = "";
+                    }
+                }
+
                 lcd.clear();
                 writeLcd16(WiFi.localIP().toString());
+            }
+
+            if (
+                remoteWifiConfigurationActive &&
+                remoteWifiTargetConnected &&
+                !webSocketAuthenticated &&
+                now - remoteWifiConnectedAt >= kBackendReconnectTimeoutMs)
+            {
+                startRemoteWifiRollback(
+                    "WiFi connected, but the backend did not reconnect. Restoring the previous network.");
             }
 
             return;
@@ -625,6 +936,14 @@ namespace
             WiFi.setAutoReconnect(reconnectEnabled);
             lcd.clear();
             writeLcd16("WiFi Failed");
+
+            if (
+                remoteWifiConfigurationActive &&
+                !remoteWifiConfigurationFailed)
+            {
+                startRemoteWifiRollback(
+                    "The requested WiFi network could not be reached. Restoring the previous network.");
+            }
         }
 
         if (reconnectEnabled &&

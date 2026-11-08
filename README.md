@@ -15,6 +15,29 @@ Production notices and device status go through the HTTPS backend. The browser
 does not call ESP32 HTTP endpoints from the deployed site. Local Wi-Fi setup is
 available only from the Vite development server over HTTP.
 
+## Remote Wi-Fi reconfiguration
+
+After the ESP32 has been provisioned locally and is connected to the backend,
+sign in to the dashboard and open **Wi-Fi configuration**. The dashboard sends
+the new credentials to the authenticated backend over HTTPS; the backend
+forwards them to the authenticated ESP32 WebSocket connection. The browser
+does not store the Wi-Fi password, and the operation status API never returns
+it.
+
+The firmware keeps the setup access point available, attempts the new network,
+and saves the new credentials only after the ESP32 reconnects and authenticates
+with the backend. If the attempt fails, it tries to restore the previous saved
+network. Remote configuration requires an already-connected ESP32 and saved
+credentials; use the local setup access point for first-time provisioning.
+If the ESP32 cannot reconnect to the backend, its Wi-Fi result may be
+uncertain; check the device through its setup access point.
+
+The backend keeps active device coordination and operation results in memory.
+Run a single backend instance: multiple instances do not share device
+connections or Wi-Fi operation state. ESP32 Wi-Fi credentials are stored in
+Preferences/NVS without application-level encryption; protect physical access
+to the board and use a trusted network.
+
 ## Configuration
 
 Copy `smart-notice-dashboard/.env.example` to
@@ -111,6 +134,10 @@ connectivity on the actual hardware.
    `include/secrets.h` file and verify its secure WebSocket authentication.
 6. Sign in to the dashboard with the configured access code, then check
    backend, device, and WebSocket status before sending a notice.
+7. Once the device is online, use the dashboard's **Wi-Fi configuration** page
+   to reconfigure its network remotely. Confirm a successful operation reports
+   the ESP32's backend reconnection; verify the new network on the physical
+   device.
 
 The backend reports a notice as delivered only after the ESP32 acknowledges
 processing its display command. The acknowledgment confirms the firmware ran

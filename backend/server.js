@@ -14,6 +14,9 @@ const DEVICE_TOKEN = process.env.ESP32_DEVICE_TOKEN;
 const DASHBOARD_ACCESS_CODE = process.env.DASHBOARD_ACCESS_CODE;
 const MAX_NOTICE_LENGTH = 200;
 const NOTICE_ACK_TIMEOUT_MS = Number(process.env.NOTICE_ACK_TIMEOUT_MS) || 10000;
+const WIFI_CONFIGURATION_TIMEOUT_MS =
+    Number(process.env.WIFI_CONFIGURATION_TIMEOUT_MS) || 120000;
+const WIFI_CONFIGURATION_RETENTION_MS = 10 * 60 * 1000;
 const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const REMEMBERED_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DASHBOARD_ORIGINS = (process.env.DASHBOARD_ORIGIN || "http://localhost:5173")
@@ -138,6 +141,143 @@ let connectedDevice = null;
 let latestNotice = null;
 let lastDeviceCommunicationAt = null;
 const pendingNotices = new Map();
+const wifiConfigurationOperations = new Map();
+let activeWifiConfigurationId = null;
+let deviceWifiStatus = {
+    connected: false,
+    ssid: "",
+    ip: "",
+    lastConnectedAt: null
+};
+
+function isRequestId(value) {
+    return typeof value === "string" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function cleanWifiConfigurationOperations() {
+    const now = Date.now();
+    for (const [id, operation] of wifiConfigurationOperations) {
+        if (operation.expiresAt && operation.expiresAt <= now) {
+            wifiConfigurationOperations.delete(id);
+        }
+    }
+}
+
+function publicWifiConfiguration(operation) {
+    return {
+        requestId: operation.id,
+        state: operation.state,
+        message: operation.message,
+        ssid: operation.ssid,
+        ip: operation.ip || "",
+        createdAt: operation.createdAt,
+        updatedAt: operation.updatedAt
+    };
+}
+
+function finishWifiConfiguration(operation, state, message, details = {}) {
+    operation.state = state;
+    operation.message = message;
+    operation.updatedAt = new Date().toISOString();
+    Object.assign(operation, details);
+
+    if (["authenticated", "failed", "timed_out"].includes(state)) {
+        clearTimeout(operation.timeout);
+        operation.expiresAt = Date.now() + WIFI_CONFIGURATION_RETENTION_MS;
+        if (activeWifiConfigurationId === operation.id) {
+            activeWifiConfigurationId = null;
+        }
+    }
+}
+
+function updateWifiConfigurationFromDevice(ws, data) {
+    if (
+        !isRequestId(data.requestId) ||
+        typeof data.state !== "string" ||
+        !["accepted", "connecting", "wifi_connected", "authenticated", "failed"].includes(data.state)
+    ) {
+        return;
+    }
+
+    const operation = wifiConfigurationOperations.get(data.requestId);
+    if (
+        !operation ||
+        activeWifiConfigurationId !== operation.id ||
+        connectedDevice !== ws
+    ) {
+        return;
+    }
+
+    operation.device = ws;
+    if (data.state === "failed") {
+        finishWifiConfiguration(
+            operation,
+            "failed",
+            "ESP32 could not connect to the requested Wi-Fi network. Its previous network remains saved.",
+        );
+        return;
+    }
+
+    const transitions = {
+        command_sent: ["accepted"],
+        accepted: ["connecting"],
+        connecting: ["wifi_connected"],
+        wifi_connected: ["authenticated"]
+    };
+    if (!transitions[operation.state]?.includes(data.state)) {
+        return;
+    }
+
+    if (data.state === "authenticated") {
+        const ssid = typeof data.ssid === "string" ? data.ssid : "";
+        const ip = typeof data.ip === "string" ? data.ip : "";
+        finishWifiConfiguration(
+            operation,
+            "authenticated",
+            "Wi-Fi connected and ESP32 authenticated with the backend.",
+            { ssid, ip }
+        );
+        return;
+    }
+
+    const messages = {
+        accepted: "ESP32 accepted the Wi-Fi configuration.",
+        connecting: "ESP32 is connecting to the requested Wi-Fi network.",
+        wifi_connected: "Wi-Fi connected; waiting for the ESP32 to authenticate with the backend."
+    };
+    operation.state = data.state;
+    operation.message = messages[data.state];
+    operation.updatedAt = new Date().toISOString();
+}
+
+function updateDeviceWifiStatus(data) {
+    if (
+        typeof data.connected !== "boolean" ||
+        typeof data.ssid !== "string" ||
+        typeof data.ip !== "string" ||
+        Buffer.byteLength(data.ssid, "utf8") > 32 ||
+        data.ip.length > 45
+    ) {
+        return;
+    }
+
+    const connected = data.connected && Boolean(data.ssid && data.ip);
+    const changedConnection =
+        connected &&
+        (!deviceWifiStatus.connected ||
+            deviceWifiStatus.ssid !== data.ssid ||
+            deviceWifiStatus.ip !== data.ip);
+
+    deviceWifiStatus = {
+        connected,
+        ssid: connected ? data.ssid : "",
+        ip: connected ? data.ip : "",
+        lastConnectedAt: changedConnection
+            ? new Date().toISOString()
+            : deviceWifiStatus.lastConnectedAt
+    };
+}
 
 function settlePendingNotice(requestId, error, acknowledgement) {
     const pending = pendingNotices.get(requestId);
@@ -218,9 +358,13 @@ wss.on("connection", (ws) => {
         }
 
         lastDeviceCommunicationAt = new Date().toISOString();
-        console.log("Message received from ESP32:", data);
+        console.log("Message received from ESP32:", data.type || "unknown");
 
-        if (data.type === "NOTICE_ACK" && typeof data.id === "string") {
+        if (data.type === "DEVICE_STATUS") {
+            updateDeviceWifiStatus(data);
+        } else if (data.type === "WIFI_CONFIG_STATUS") {
+            updateWifiConfigurationFromDevice(ws, data);
+        } else if (data.type === "NOTICE_ACK" && typeof data.id === "string") {
             const pending = pendingNotices.get(data.id);
             if (pending && pending.device === ws) {
                 if (data.success === true) {
@@ -257,7 +401,25 @@ wss.on("connection", (ws) => {
 
         if (connectedDevice === ws) {
             connectedDevice = null;
+            deviceWifiStatus.connected = false;
+            deviceWifiStatus.ssid = "";
+            deviceWifiStatus.ip = "";
             console.log("ESP32 disconnected.");
+        }
+        if (
+            activeWifiConfigurationId &&
+            ["command_sent", "accepted"].includes(
+                wifiConfigurationOperations.get(activeWifiConfigurationId)?.state
+            )
+        ) {
+            const operation = wifiConfigurationOperations.get(activeWifiConfigurationId);
+            if (operation?.device === ws) {
+                finishWifiConfiguration(
+                    operation,
+                    "failed",
+                    "ESP32 disconnected before starting the Wi-Fi connection."
+                );
+            }
         }
         for (const [requestId, pending] of pendingNotices) {
             if (pending.device === ws) {
@@ -360,6 +522,141 @@ app.post(
     }
 );
 
+app.post(
+    "/api/device/wifi-config",
+    authenticateDashboard,
+    (req, res) => {
+        const ssid = typeof req.body?.ssid === "string"
+            ? req.body.ssid.trim()
+            : "";
+        const password = req.body?.password;
+
+        if (
+            !ssid ||
+            Buffer.byteLength(ssid, "utf8") > 32
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Wi-Fi SSID must contain 1 to 32 UTF-8 bytes."
+            });
+        }
+
+        if (
+            typeof password !== "string" ||
+            (password.length > 0 &&
+                (Buffer.byteLength(password, "utf8") < 8 ||
+                    Buffer.byteLength(password, "utf8") > 63))
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Wi-Fi password must be 8 to 63 UTF-8 bytes, or empty for an open network."
+            });
+        }
+
+        if (
+            !connectedDevice ||
+            connectedDevice.readyState !== WebSocket.OPEN ||
+            !connectedDevice.authenticated
+        ) {
+            return res.status(503).json({
+                success: false,
+                message: "ESP32 is not connected to the backend."
+            });
+        }
+
+        if (activeWifiConfigurationId) {
+            const activeOperation = wifiConfigurationOperations.get(activeWifiConfigurationId);
+            if (activeOperation && !activeOperation.expiresAt) {
+                return res.status(409).json({
+                    success: false,
+                    message: "A Wi-Fi configuration operation is already in progress."
+                });
+            }
+        }
+
+        cleanWifiConfigurationOperations();
+        const requestId = crypto.randomUUID();
+        const operation = {
+            id: requestId,
+            state: "command_sent",
+            message: "Wi-Fi configuration command sent to ESP32.",
+            ssid,
+            ip: "",
+            device: connectedDevice,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            expiresAt: null,
+            timeout: null
+        };
+        operation.timeout = setTimeout(() => {
+            const message = operation.state === "connecting" ||
+                operation.state === "wifi_connected"
+                ? "ESP32 did not confirm backend reconnection. Wi-Fi may have connected; verify the device using its recovery access point."
+                : "ESP32 did not complete the Wi-Fi configuration.";
+            finishWifiConfiguration(operation, "timed_out", message);
+        }, WIFI_CONFIGURATION_TIMEOUT_MS);
+        wifiConfigurationOperations.set(requestId, operation);
+        activeWifiConfigurationId = requestId;
+
+        try {
+            connectedDevice.send(JSON.stringify({
+                type: "WIFI_CONFIG",
+                requestId,
+                ssid,
+                password
+            }), (error) => {
+                if (error) {
+                    finishWifiConfiguration(
+                        operation,
+                        "failed",
+                        "The Wi-Fi configuration command could not be sent to the ESP32."
+                    );
+                }
+            });
+        } catch {
+            finishWifiConfiguration(
+                operation,
+                "failed",
+                "The Wi-Fi configuration command could not be sent to the ESP32."
+            );
+        }
+
+        return res.status(202).json({
+            success: true,
+            requestId,
+            state: operation.state,
+            message: operation.message
+        });
+    }
+);
+
+app.get(
+    "/api/device/wifi-config/:requestId",
+    authenticateDashboard,
+    (req, res) => {
+        if (!isRequestId(req.params.requestId)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Wi-Fi configuration request ID."
+            });
+        }
+
+        cleanWifiConfigurationOperations();
+        const operation = wifiConfigurationOperations.get(req.params.requestId);
+        if (!operation) {
+            return res.status(404).json({
+                success: false,
+                message: "Wi-Fi configuration request was not found or has expired."
+            });
+        }
+
+        return res.json({
+            success: true,
+            operation: publicWifiConfiguration(operation)
+        });
+    }
+);
+
 // Device connection status
 app.get(
     "/api/device/status",
@@ -375,6 +672,7 @@ app.get(
                 connectedDevice.readyState === WebSocket.OPEN
             ),
             lastSeenAt: lastDeviceCommunicationAt,
+            wifi: deviceWifiStatus,
             latestNotice
         });
     }

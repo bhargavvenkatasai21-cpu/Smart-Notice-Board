@@ -3,7 +3,8 @@
 **Automated check date:** 2026-11-08  
 **Firmware target:** PlatformIO `esp32dev`, ESP32 Arduino framework  
 **Scope:** Frontend tests/build/lint, backend API and WebSocket integration tests,
-firmware compilation, and code review after backend routing and delivery-acknowledgment changes.
+firmware compilation, and code review after remote Wi-Fi configuration and
+delivery-acknowledgment changes.
 
 The hardware results below are the results supplied by the project owner. They
 were not rerun after these changes because no ESP32, LCD, or project Wi-Fi
@@ -32,21 +33,23 @@ provided and the behavior still needs physical verification.
 | 18 | ESP32 restart and Wi-Fi recovery | Saved credentials are loaded after reboot and station reconnection begins automatically. | Owner reported not tested. | NOT TESTED | Startup code invokes the saved-credential path; hardware reboot behavior is unverified. | Reboot and confirm station IP/status without using the connect form. |
 | 19 | Router shutdown and recovery | The board detects loss and retries saved credentials when the router returns. | Owner reported automatic Wi-Fi recovery passed. | PASS (owner-reported baseline) | Post-change recovery timing has not been measured. | Retest after flashing; observe status through outage and recovery. |
 | 20 | Dashboard-to-device notice delivery | Dashboard sends notice through authenticated HTTPS API; success waits for an ESP32 WebSocket acknowledgment. | Backend integration test passes with a simulated authenticated device. No physical LCD test was run. | PASS (simulated backend) / NOT TESTED (hardware) | Firmware acknowledges after running the LCD display routine; physical LCD output cannot be sensed remotely. | Flash firmware and confirm notice/acknowledgment behavior on the board and LCD. |
+| 21 | Remote Wi-Fi configuration | Authenticated dashboard credentials reach the ESP32; result is confirmed only after backend reconnection, with prior credentials retained on failure. | Dashboard service/UI tests and backend simulated-device tests pass; firmware compiles. No physical Wi-Fi test was run. | PASS (automated) / NOT TESTED (hardware) | Backend operation state is in memory and requires a single backend instance. ESP32 Preferences/NVS credentials are not application-encrypted. | Flash firmware; test success, wrong password, backend loss, rollback, and recovery AP behavior on the board. |
 
 ## Automated checks run
 
 | Check | Result | Notes |
 |---|---|---|
-| PlatformIO firmware build | PASS | `C:\Users\bharg\.platformio\penv\Scripts\pio.exe run`; ESP32 framework 3.3.12. Firmware was compiled, not flashed. Flash usage is 97.6% of the configured application partition. |
+| PlatformIO firmware build | PASS | `C:\Users\bharg\.platformio\penv\Scripts\pio.exe run`; ESP32 framework 3.3.12. Firmware was compiled, not flashed. Flash usage is 98.4% of the configured application partition; remaining headroom is limited. |
 | PlatformIO dependencies | PASS | Resolved `LiquidCrystal 1.0.7`, `ArduinoJson 7.4.3`, `WebSockets 2.7.3`, `Preferences`, `WebServer`, and `WiFi`. |
 | Dashboard production build | PASS | `npm run build`; Vite 8.3.6. |
 | Dashboard lint | PASS | `npm run lint`; no errors or warnings. |
-| Dashboard tests | PASS | `npm test`; 53 tests passed across 4 files. Covers access-code login, empty input, Remember me session storage/restoration, invalid-session cleanup, legacy-token removal, logout, backend routing, notice validation/delivery, and local Wi-Fi provisioning. |
-| Backend integration tests | PASS | `npm test`; 11 tests passed, including access-code authentication, session revocation, protected status/notices, malformed requests, offline device, unchanged ESP32 WebSocket auth, successful acknowledgment, 200-character notice, and acknowledgment timeout. Uses a simulated WebSocket device. |
+| Dashboard tests | PASS | `npm test`; 61 tests passed across 5 files. Includes authenticated remote Wi-Fi request/polling, credential validation, progress/success/failure UI, password clearing, sign-in-gated navigation, and existing session, notice, and local provisioning behavior. |
+| Backend integration tests | PASS | `npm test`; 14 tests passed, including authenticated Wi-Fi configuration, invalid credentials, duplicate operations, request IDs, reconnect success, timeout, and password omission from operation results, plus the existing authentication, status, and notice scenarios. Uses a simulated WebSocket device. |
 | Deployed Render health check | PASS | Unauthenticated `GET /api/health` returned `status: OK` and `websocketConnected: true` at test time. Authenticated production routes were not called. |
 | Local configured access-code smoke check | PASS | Using the ignored backend `.env`, login returned HTTP 200, authenticated device status returned 200, logout returned 200, and the revoked session then received 401. The configured code was not printed. |
 | Firmware logic unit tests | NOT AVAILABLE | The project has no host-side firmware unit-test harness. Scroll boundaries and Wi-Fi transitions still need board-level verification. |
 | Browser/device integration check | NOT TESTED | No physical ESP32, LCD, or project Wi-Fi network was accessible. Backend integration used a simulated WebSocket device; no live board/LCD delivery was performed. |
+| Dependency audit | PASS WITH FINDINGS | `npm audit` reported 4 moderate dashboard advisories and 2 moderate backend advisories; no high or critical findings. npm reports fixes only through major-version changes/downgrades. Dependencies were not changed. |
 
 ## Findings and retest notes
 
@@ -82,6 +85,17 @@ provided and the behavior still needs physical verification.
   matching `NOTICE_ACK`. It returns success only after firmware acknowledges
   the display routine. The acknowledgment does not prove that the LCD hardware
   physically rendered the characters.
+- Remote Wi-Fi configuration is available only while the ESP32 is connected
+  and authenticated. It travels through the authenticated HTTPS backend and
+  existing authenticated WSS channel. The API omits passwords from operation
+  status responses. The backend holds operations in memory, so use one backend
+  instance; a restart or process split can prevent the dashboard from
+  confirming an in-progress operation.
+- Firmware commits replacement credentials only after Wi-Fi and backend
+  authentication succeed. On a connection or persistence failure it attempts
+  to restore the previously saved network while leaving the setup AP enabled.
+  Credentials remain plaintext in ESP32 Preferences/NVS, and there is no
+  physical-board verification in this report.
 - The prior firmware could mistake an existing station connection for success
   during a new connection attempt and did not prevent concurrent attempts. The
   revised state logic cancels the previous station attempt, confirms the

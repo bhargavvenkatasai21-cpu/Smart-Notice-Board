@@ -8,6 +8,7 @@ process.env.DASHBOARD_ACCESS_CODE = "test-access-code";
 process.env.DASHBOARD_ORIGIN =
     "http://localhost:5173,https://dashboard.example.test";
 process.env.NOTICE_ACK_TIMEOUT_MS = "300";
+process.env.WIFI_CONFIGURATION_TIMEOUT_MS = "500";
 
 const { server } = require("./server");
 const DEVICE_TOKEN = process.env.ESP32_DEVICE_TOKEN;
@@ -194,6 +195,185 @@ test("notice requests validate content and report a disconnected device", async 
     });
     assert.equal(response.status, 503);
     assert.equal((await response.json()).delivered, false);
+});
+
+test("Wi-Fi configuration requires a session, valid credentials, and a connected device", async () => {
+    const unauthenticated = await fetch(`${baseUrl}/api/device/wifi-config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ssid: "Office", password: "password123" })
+    });
+    assert.equal(unauthenticated.status, 401);
+
+    for (const configuration of [
+        { ssid: " ", password: "password123" },
+        { ssid: "x".repeat(33), password: "password123" },
+        { ssid: "Cafe", password: "short" },
+        { ssid: "Cafe", password: 12345678 }
+    ]) {
+        const response = await fetch(`${baseUrl}/api/device/wifi-config`, {
+            method: "POST",
+            headers: dashboardHeaders(),
+            body: JSON.stringify(configuration)
+        });
+        assert.equal(response.status, 400);
+        assert.equal(JSON.stringify(await response.json()).includes(configuration.password), false);
+    }
+
+    const disconnected = await fetch(`${baseUrl}/api/device/wifi-config`, {
+        method: "POST",
+        headers: dashboardHeaders(),
+        body: JSON.stringify({ ssid: "Office", password: "password123" })
+    });
+    assert.equal(disconnected.status, 503);
+});
+
+test("Wi-Fi configuration tracks request IDs through reconnect and never returns its password", async () => {
+    const oldSocket = await connectDevice();
+    const commandReceived = new Promise((resolve, reject) => {
+        const timeout = setTimeout(
+            () => reject(new Error("Wi-Fi configuration command was not sent")),
+            1000
+        );
+        oldSocket.once("message", (raw) => {
+            clearTimeout(timeout);
+            resolve(JSON.parse(raw.toString()));
+        });
+    });
+
+    const configurationResponse = await fetch(`${baseUrl}/api/device/wifi-config`, {
+        method: "POST",
+        headers: dashboardHeaders(),
+        body: JSON.stringify({ ssid: "New office", password: "new-password" })
+    });
+    const initialResult = await configurationResponse.json();
+    const command = await commandReceived;
+    assert.equal(configurationResponse.status, 202);
+    assert.equal(command.type, "WIFI_CONFIG");
+    assert.equal(command.requestId, initialResult.requestId);
+    assert.equal(command.ssid, "New office");
+    assert.equal(command.password, "new-password");
+    assert.equal(JSON.stringify(initialResult).includes("new-password"), false);
+
+    oldSocket.send(JSON.stringify({
+        type: "WIFI_CONFIG_STATUS",
+        requestId: command.requestId,
+        state: "accepted"
+    }));
+    oldSocket.send(JSON.stringify({
+        type: "WIFI_CONFIG_STATUS",
+        requestId: command.requestId,
+        state: "connecting"
+    }));
+
+    const duplicate = await fetch(`${baseUrl}/api/device/wifi-config`, {
+        method: "POST",
+        headers: dashboardHeaders(),
+        body: JSON.stringify({ ssid: "Another network", password: "another-pass" })
+    });
+    assert.equal(duplicate.status, 409);
+
+    oldSocket.send(JSON.stringify({
+        type: "WIFI_CONFIG_STATUS",
+        requestId: "00000000-0000-4000-8000-000000000000",
+        state: "wifi_connected"
+    }));
+    oldSocket.close();
+    await new Promise((resolve) => oldSocket.once("close", resolve));
+
+    const newSocket = await connectDevice();
+    newSocket.send(JSON.stringify({
+        type: "DEVICE_STATUS",
+        connected: true,
+        ssid: "New office",
+        ip: "192.168.10.20"
+    }));
+    newSocket.send(JSON.stringify({
+        type: "WIFI_CONFIG_STATUS",
+        requestId: command.requestId,
+        state: "wifi_connected"
+    }));
+    newSocket.send(JSON.stringify({
+        type: "WIFI_CONFIG_STATUS",
+        requestId: command.requestId,
+        state: "authenticated",
+        ssid: "New office",
+        ip: "192.168.10.20"
+    }));
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const operationResponse = await fetch(
+        `${baseUrl}/api/device/wifi-config/${command.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    const operationResult = await operationResponse.json();
+    assert.equal(operationResponse.status, 200);
+    assert.equal(operationResult.operation.state, "authenticated");
+    assert.equal(operationResult.operation.ssid, "New office");
+    assert.equal(operationResult.operation.ip, "192.168.10.20");
+    assert.equal(JSON.stringify(operationResult).includes("new-password"), false);
+
+    const statusResponse = await fetch(`${baseUrl}/api/device/status`, {
+        headers: dashboardHeaders()
+    });
+    const status = await statusResponse.json();
+    assert.deepEqual(status.wifi, {
+        connected: true,
+        ssid: "New office",
+        ip: "192.168.10.20",
+        lastConnectedAt: status.wifi.lastConnectedAt
+    });
+    assert.ok(status.wifi.lastConnectedAt);
+
+    newSocket.close();
+    await new Promise((resolve) => newSocket.once("close", resolve));
+    deviceSocket = null;
+});
+
+test("Wi-Fi configuration timeout is reported when the ESP32 never reconnects", async () => {
+    const socket = await connectDevice();
+    const commandReceived = new Promise((resolve, reject) => {
+        const timeout = setTimeout(
+            () => reject(new Error("Wi-Fi configuration command was not sent")),
+            1000
+        );
+        socket.once("message", (raw) => {
+            clearTimeout(timeout);
+            resolve(JSON.parse(raw.toString()));
+        });
+    });
+    const response = await fetch(`${baseUrl}/api/device/wifi-config`, {
+        method: "POST",
+        headers: dashboardHeaders(),
+        body: JSON.stringify({ ssid: "Office", password: "password123" })
+    });
+    const result = await response.json();
+    const command = await commandReceived;
+    assert.equal(command.requestId, result.requestId);
+
+    socket.send(JSON.stringify({
+        type: "WIFI_CONFIG_STATUS",
+        requestId: command.requestId,
+        state: "accepted"
+    }));
+    socket.send(JSON.stringify({
+        type: "WIFI_CONFIG_STATUS",
+        requestId: command.requestId,
+        state: "connecting"
+    }));
+    socket.close();
+    await new Promise((resolve) => socket.once("close", resolve));
+    deviceSocket = null;
+    await new Promise((resolve) => setTimeout(resolve, 550));
+
+    const statusResponse = await fetch(
+        `${baseUrl}/api/device/wifi-config/${command.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    const status = await statusResponse.json();
+    assert.equal(status.operation.state, "timed_out");
+    assert.match(status.operation.message, /Wi-Fi may have connected/);
+    assert.equal(JSON.stringify(status).includes("password123"), false);
 });
 
 test("authenticated ESP32 receives notices and confirms delivery", async () => {

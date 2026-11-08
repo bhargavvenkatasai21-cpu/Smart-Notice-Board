@@ -3,6 +3,7 @@ import Header from "./components/Header.jsx";
 import Footer from "./components/Footer.jsx";
 import Navbar from "./components/Navbar.jsx";
 import SendNotice from "./pages/SendNotice.jsx";
+import RemoteWiFiConfiguration from "./pages/RemoteWiFiConfiguration.jsx";
 import WiFiSettings from "./pages/WiFiSettings.jsx";
 import {
   connectWiFi,
@@ -328,6 +329,7 @@ function App() {
           <Navbar
             activePage={page}
             showSetup={LOCAL_SETUP_AVAILABLE}
+            showRemoteWifi={Boolean(dashboardSession)}
             onNavigate={handleNavigate}
           />
           {dashboardSession && (
@@ -398,6 +400,13 @@ function App() {
 
         {page === "setup" && LOCAL_SETUP_AVAILABLE ? (
           <WiFiSettings {...localWifiProps} />
+        ) : page === "wifi" && dashboardSession ? (
+          <RemoteWiFiConfiguration
+            deviceConnected={deviceConnected}
+            onConfigured={refreshBackendStatus}
+            sessionToken={dashboardSession}
+            wifiStatus={deviceStatus?.wifi}
+          />
         ) : deviceNeedsLogin ? (
           <section className="card access-card" aria-labelledby="access-title">
             <div className="card-heading">

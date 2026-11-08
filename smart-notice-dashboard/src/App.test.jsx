@@ -8,8 +8,10 @@ import {
   getBackendHealth,
   getDeviceStatus,
   getESP32Address,
+  getRemoteWifiConfiguration,
   getStatus,
   logoutDashboardSession,
+  startRemoteWifiConfiguration,
 } from "./services/esp32Service.js";
 
 vi.mock("./services/esp32Service.js", () => ({
@@ -19,11 +21,13 @@ vi.mock("./services/esp32Service.js", () => ({
   getBackendHealth: vi.fn(),
   getDeviceStatus: vi.fn(),
   getESP32Address: vi.fn(),
+  getRemoteWifiConfiguration: vi.fn(),
   getStatus: vi.fn(),
   logoutDashboardSession: vi.fn(),
   reconnectWiFi: vi.fn(),
   sendNotice: vi.fn(),
   setESP32Address: vi.fn((address) => address),
+  startRemoteWifiConfiguration: vi.fn(),
 }));
 
 const localDisconnected = {
@@ -105,6 +109,28 @@ describe("Dashboard backend integration and local provisioning", () => {
     );
     expect(screen.getByText("Meeting at 10")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+  });
+
+  it("shows remote Wi-Fi configuration only after dashboard sign-in", async () => {
+    const user = userEvent.setup();
+    getDeviceStatus.mockResolvedValue(remoteConnected);
+    render(<App />);
+
+    expect(
+      screen.queryByRole("button", { name: "Wi-Fi configuration" }),
+    ).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Dashboard access code"), "operator-code");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Wi-Fi configuration" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "ESP32 Wi-Fi configuration" }),
+    ).toBeInTheDocument();
+    expect(startRemoteWifiConfiguration).not.toHaveBeenCalled();
+    expect(getRemoteWifiConfiguration).not.toHaveBeenCalled();
   });
 
   it("does not persist a session when Remember me is unchecked", async () => {

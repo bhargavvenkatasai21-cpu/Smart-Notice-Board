@@ -424,6 +424,18 @@
   color: #a33232;
 }
 
+.feedback.info {
+  border-color: #cbdcf5;
+  background: #edf5ff;
+  color: #315b9d;
+}
+
+.feedback.warning {
+  border-color: #f0dfb8;
+  background: #fff9eb;
+  color: #795b1a;
+}
+
 .network-note {
   margin: 26px 4px 0;
   color: #78869a;

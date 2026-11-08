@@ -7,12 +7,14 @@ import {
   getBackendHealth,
   getDeviceStatus,
   getESP32Address,
+  getRemoteWifiConfiguration,
   getStatus,
   logoutDashboardSession,
   normalizeESP32Address,
   reconnectWiFi,
   sendNotice,
   setESP32Address,
+  startRemoteWifiConfiguration,
 } from "./esp32Service.js";
 
 const ACCESS_POINT = "http://192.168.4.1";
@@ -258,6 +260,84 @@ describe("Wi-Fi actions", () => {
 });
 
 describe("status and notice API", () => {
+  it("starts a remote Wi-Fi configuration using the authenticated backend", async () => {
+    const response = {
+      success: true,
+      requestId: "request-123",
+      state: "command_sent",
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(response, 202));
+
+    await expect(
+      startRemoteWifiConfiguration("session-token", " Office WiFi ", "password123"),
+    ).resolves.toEqual(response);
+
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/device/wifi-config`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: "Bearer session-token",
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({ ssid: "Office WiFi", password: "password123" }),
+      }),
+    );
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
+  });
+
+  it("validates remote network credentials before sending them", async () => {
+    await expect(
+      startRemoteWifiConfiguration("session-token", "  ", "password123"),
+    ).rejects.toThrow(/network name/);
+    await expect(
+      startRemoteWifiConfiguration("session-token", "Office", "short"),
+    ).rejects.toThrow(/between 8 and 63 UTF-8 bytes/);
+    await expect(
+      startRemoteWifiConfiguration("session-token", "☃".repeat(11), "password123"),
+    ).rejects.toThrow(/32 UTF-8 bytes/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("polls a remote Wi-Fi operation using the authenticated backend", async () => {
+    const response = {
+      success: true,
+      operation: {
+        requestId: "request-123",
+        state: "connecting",
+        message: "ESP32 is connecting",
+      },
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(response));
+
+    await expect(
+      getRemoteWifiConfiguration("session-token", "request-123"),
+    ).resolves.toEqual(response.operation);
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/device/wifi-config/request-123`,
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          Authorization: "Bearer session-token",
+        }),
+      }),
+    );
+  });
+
+  it("rejects malformed remote Wi-Fi operation status responses", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        success: true,
+        operation: { requestId: "wrong-request", state: "connecting" },
+      }),
+    );
+
+    await expect(
+      getRemoteWifiConfiguration("session-token", "request-123"),
+    ).rejects.toThrow(/invalid Wi-Fi operation status/);
+  });
+
   it("exchanges the access code for a backend session", async () => {
     const session = {
       success: true,

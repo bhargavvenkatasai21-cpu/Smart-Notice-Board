@@ -193,6 +193,87 @@ export async function getDeviceStatus(sessionToken) {
   return status;
 }
 
+function utf8ByteLength(value) {
+  return new TextEncoder().encode(value).length;
+}
+
+function validateRemoteWifiConfiguration(ssid, password) {
+  if (typeof ssid !== "string" || !ssid.trim()) {
+    throw new Error("Enter a Wi-Fi network name.");
+  }
+  if (utf8ByteLength(ssid.trim()) > 32) {
+    throw new Error("Wi-Fi network names can be at most 32 UTF-8 bytes.");
+  }
+  if (
+    typeof password !== "string" ||
+    (password.length > 0 &&
+      (utf8ByteLength(password) < 8 || utf8ByteLength(password) > 63))
+  ) {
+    throw new Error(
+      "Use a Wi-Fi password between 8 and 63 UTF-8 bytes, or leave it empty for an open network.",
+    );
+  }
+}
+
+export async function startRemoteWifiConfiguration(
+  sessionToken,
+  ssid,
+  password,
+) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
+    throw new Error("Sign in before configuring ESP32 Wi-Fi.");
+  }
+  validateRemoteWifiConfiguration(ssid, password);
+
+  const result = await requestBackend("/api/device/wifi-config", {
+    method: "POST",
+    sessionToken,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ssid: ssid.trim(), password }),
+  });
+  if (
+    result?.success !== true ||
+    typeof result.requestId !== "string" ||
+    result.state !== "command_sent"
+  ) {
+    throw new Error(
+      result?.message || "The backend did not accept the Wi-Fi configuration.",
+    );
+  }
+  return result;
+}
+
+export async function getRemoteWifiConfiguration(sessionToken, requestId) {
+  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
+    throw new Error("Sign in before checking Wi-Fi configuration.");
+  }
+  if (typeof requestId !== "string" || !requestId.trim()) {
+    throw new Error("A Wi-Fi configuration request ID is required.");
+  }
+
+  const result = await requestBackend(
+    `/api/device/wifi-config/${encodeURIComponent(requestId)}`,
+    { method: "GET", sessionToken },
+  );
+  const operation = result?.operation;
+  if (
+    result?.success !== true ||
+    operation?.requestId !== requestId ||
+    ![
+      "command_sent",
+      "accepted",
+      "connecting",
+      "wifi_connected",
+      "authenticated",
+      "failed",
+      "timed_out",
+    ].includes(operation.state)
+  ) {
+    throw new Error("The backend returned an invalid Wi-Fi operation status.");
+  }
+  return operation;
+}
+
 function assertLocalSetupEnvironment() {
   if (
     !import.meta.env?.DEV ||
