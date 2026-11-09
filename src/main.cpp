@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ctype.h>
+#include <esp_system.h>
 #include <string.h>
 #include <time.h>
 #include <LiquidCrystal.h>
@@ -8,6 +9,9 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WebSocketsClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 #include "secrets.h"
 #include "ota_config.h"
 #include "trust_roots.h"
@@ -24,7 +28,7 @@ namespace
 #endif
     constexpr char kApPassword[] = BOARD_AP_PASSWORD;
     constexpr char kPreferencesNamespace[] = "wifi";
-    constexpr char kFirmwareVersion[] = "1.0.1";
+    constexpr char kFirmwareVersion[] = "1.0.0";
 
     constexpr char kBackendHost[] = "smart-notice-board-api.onrender.com";
     constexpr uint16_t kBackendPort = 443;
@@ -91,6 +95,22 @@ namespace
     String remoteWifiPreviousPassword;
     String remoteWifiFailureMessage;
     String firmwareUpdateRequestId;
+
+    enum class FirmwareUpdateEventType : uint8_t
+    {
+        Status,
+        Complete,
+    };
+
+    struct FirmwareUpdateEvent
+    {
+        FirmwareUpdateEventType type;
+        char state[16];
+        char version[32];
+        char message[241];
+    };
+
+    QueueHandle_t firmwareUpdateStatusQueue = nullptr;
 
     constexpr unsigned long kBackendReconnectTimeoutMs = 60000;
 
@@ -357,7 +377,68 @@ namespace
         const char *state,
         const String &version)
     {
-        sendFirmwareUpdateStatus(firmwareUpdateRequestId, state, version);
+        FirmwareUpdateEvent event{};
+        event.type = FirmwareUpdateEventType::Status;
+        strncpy(event.state, state, sizeof(event.state) - 1);
+        version.toCharArray(event.version, sizeof(event.version));
+        xQueueSend(firmwareUpdateStatusQueue, &event, portMAX_DELAY);
+    }
+
+    void queueFirmwareUpdateCompletion()
+    {
+        FirmwareUpdateEvent event{};
+        event.type = FirmwareUpdateEventType::Complete;
+        xQueueSend(firmwareUpdateStatusQueue, &event, portMAX_DELAY);
+    }
+
+    void firmwareUpdateTask(void *)
+    {
+        Serial.println("[OTA] Firmware update worker started.");
+        String updatedVersion;
+        String failureMessage;
+        const bool updateStarted = firmware_update::performUpdate(
+            kFirmwareVersion,
+            reportFirmwareUpdateStatus,
+            updatedVersion,
+            failureMessage);
+
+        if (
+            !updateStarted &&
+            failureMessage !=
+                "The ESP32 already has the latest firmware.")
+        {
+            FirmwareUpdateEvent event{};
+            event.type = FirmwareUpdateEventType::Status;
+            strncpy(event.state, "failed", sizeof(event.state) - 1);
+            failureMessage.toCharArray(event.message, sizeof(event.message));
+            xQueueSend(firmwareUpdateStatusQueue, &event, portMAX_DELAY);
+        }
+
+        queueFirmwareUpdateCompletion();
+        vTaskDelete(nullptr);
+    }
+
+    void processFirmwareUpdateEvents()
+    {
+        FirmwareUpdateEvent event{};
+        while (
+            firmwareUpdateStatusQueue != nullptr &&
+            xQueueReceive(firmwareUpdateStatusQueue, &event, 0) == pdTRUE)
+        {
+            if (event.type == FirmwareUpdateEventType::Status)
+            {
+                sendFirmwareUpdateStatus(
+                    firmwareUpdateRequestId,
+                    event.state,
+                    event.version,
+                    event.message);
+            }
+            else
+            {
+                firmwareUpdateInProgress = false;
+                firmwareUpdateRequestId = "";
+            }
+        }
     }
 
     void handleRemoteFirmwareUpdate(JsonDocument &document)
@@ -384,28 +465,36 @@ namespace
             return;
         }
 
+        if (firmwareUpdateStatusQueue == nullptr)
+        {
+            sendFirmwareUpdateStatus(
+                requestIdValue,
+                "failed",
+                "",
+                "Firmware update task could not be initialized.");
+            return;
+        }
+
         firmwareUpdateInProgress = true;
         firmwareUpdateRequestId = requestIdValue;
-        String updatedVersion;
-        String failureMessage;
-        const bool updateStarted = firmware_update::performUpdate(
-            kFirmwareVersion,
-            reportFirmwareUpdateStatus,
-            updatedVersion,
-            failureMessage);
-        if (
-            !updateStarted &&
-            failureMessage !=
-                "The ESP32 already has the latest firmware.")
+        Serial.println("[OTA] Starting firmware update worker.");
+        const BaseType_t taskCreated = xTaskCreate(
+            firmwareUpdateTask,
+            "firmwareUpdate",
+            16384,
+            nullptr,
+            1,
+            nullptr);
+        if (taskCreated != pdPASS)
         {
             sendFirmwareUpdateStatus(
                 firmwareUpdateRequestId,
                 "failed",
                 "",
-                failureMessage);
+                "Firmware update task could not be started.");
+            firmwareUpdateInProgress = false;
+            firmwareUpdateRequestId = "";
         }
-        firmwareUpdateInProgress = false;
-        firmwareUpdateRequestId = "";
     }
 
     void sendDeviceStatus()
@@ -1360,6 +1449,15 @@ void setup()
 
     Serial.println();
     Serial.println("Starting Smart Notice Board...");
+    Serial.printf(
+        "Reset reason code: %d\n",
+        static_cast<int>(esp_reset_reason()));
+    firmwareUpdateStatusQueue = xQueueCreate(8, sizeof(FirmwareUpdateEvent));
+    if (firmwareUpdateStatusQueue == nullptr)
+    {
+        Serial.println(
+            "ERROR: OTA status queue unavailable; firmware updates are disabled.");
+    }
     if (kUsingDefaultApPassword)
     {
         Serial.println(
@@ -1420,6 +1518,7 @@ void loop()
         webSocket.loop();
     }
 
+    processFirmwareUpdateEvents();
     updateNoticeScroll();
     delay(2);
 }

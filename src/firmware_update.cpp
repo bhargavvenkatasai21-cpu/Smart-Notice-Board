@@ -16,7 +16,9 @@ namespace
     constexpr size_t kMaximumManifestBytes = 4096;
     constexpr size_t kDownloadBufferBytes = 4096;
     constexpr uint64_t kMaximumFirmwareBytes = 1507328;
-    constexpr unsigned long kRequestTimeoutMs = 15000;
+    constexpr unsigned long kRequestTimeoutMs = 60000;
+    constexpr unsigned long kStreamTimeoutMs = 60000;
+    constexpr size_t kProgressLogIntervalBytes = 64 * 1024;
     constexpr uint16_t kMaximumHttpRedirects = 5;
     constexpr char kSignatureContext[] = "SmartNoticeBoard-OTA-v1\n";
 
@@ -288,39 +290,70 @@ namespace
         firmware_update::StatusCallback reportStatus,
         String &failureMessage)
     {
+        Serial.println("[OTA] Starting firmware download...");
+
         WiFiClientSecure client;
         client.setCACert(kTrustedCaCertificates);
+        client.setTimeout(kStreamTimeoutMs);
 
         HTTPClient http;
         http.setTimeout(kRequestTimeoutMs);
+        http.setReuse(false);
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         http.setRedirectLimit(kMaximumHttpRedirects);
+
         if (!http.begin(client, firmwareUrl))
         {
+            Serial.println("[OTA] ERROR: Firmware HTTP begin failed.");
             failureMessage = "Could not start the firmware download.";
             return false;
         }
 
+        Serial.println("[OTA] Sending firmware HTTPS GET request...");
         const int statusCode = http.GET();
+        Serial.printf("[OTA] Firmware HTTP status: %d\n", statusCode);
         if (statusCode != HTTP_CODE_OK)
         {
+            Serial.printf("[OTA] Firmware HTTP error: %s\n",
+                          HTTPClient::errorToString(statusCode).c_str());
             http.end();
             failureMessage = "The firmware download failed.";
             return false;
         }
 
         const int contentLength = http.getSize();
-        if (
-            contentLength <= 0 ||
+        Serial.printf("[OTA] Firmware HTTP content length: %d bytes\n",
+                      contentLength);
+        Serial.printf("[OTA] Signed manifest size: %u bytes\n",
+                      static_cast<unsigned int>(firmwareSize));
+
+        // A positive Content-Length must match the signed manifest. A value of
+        // -1 means the server did not provide a length; the signed size and
+        // SHA-256 checks below remain authoritative.
+        if (contentLength > 0 &&
             static_cast<size_t>(contentLength) != firmwareSize)
         {
+            Serial.println("[OTA] ERROR: HTTP content length differs from signed size.");
             http.end();
-            failureMessage = "The firmware download size did not match the signed manifest.";
+            failureMessage =
+                "The firmware download size did not match the signed manifest.";
             return false;
         }
 
+        Stream *stream = http.getStreamPtr();
+        if (stream == nullptr)
+        {
+            Serial.println("[OTA] ERROR: Firmware response stream is unavailable.");
+            http.end();
+            failureMessage = "The firmware download stream is unavailable.";
+            return false;
+        }
+        stream->setTimeout(kStreamTimeoutMs);
+
         if (!Update.begin(firmwareSize, U_FLASH))
         {
+            Serial.printf("[OTA] ERROR: Update.begin failed: %s\n",
+                          Update.errorString());
             http.end();
             failureMessage = String("OTA partition could not be opened: ") +
                              Update.errorString();
@@ -341,42 +374,84 @@ namespace
 
         uint8_t buffer[kDownloadBufferBytes];
         size_t received = 0;
-        Stream *stream = http.getStreamPtr();
-        bool downloadSucceeded = stream != nullptr;
-        while (downloadSucceeded && received < firmwareSize)
+        size_t nextProgressLog = kProgressLogIntervalBytes;
+        bool downloadSucceeded = true;
+
+        while (received < firmwareSize)
         {
             const size_t remaining = firmwareSize - received;
-            const size_t wanted = min(sizeof(buffer), remaining);
+            const size_t wanted =
+                (sizeof(buffer) < remaining) ? sizeof(buffer) : remaining;
             const size_t count = stream->readBytes(buffer, wanted);
-            if (
-                count == 0 ||
-                Update.write(buffer, count) != count ||
-                mbedtls_sha256_update(
-                    &hashContext,
-                    buffer,
-                    count) != 0)
+
+            if (count == 0)
             {
+                Serial.printf("[OTA] Download stopped at byte %u\n",
+                              static_cast<unsigned int>(received));
+                Serial.printf("[OTA] Stream connected: %s\n",
+                              client.connected() ? "YES" : "NO");
+                Serial.printf("[OTA] Stream available: %d\n",
+                              stream->available());
+                downloadSucceeded = false;
+                break;
+            }
+
+            const size_t written = Update.write(buffer, count);
+            if (written != count)
+            {
+                Serial.printf("[OTA] ERROR: Flash write failed at byte %u\n",
+                              static_cast<unsigned int>(received));
+                downloadSucceeded = false;
+                break;
+            }
+
+            if (mbedtls_sha256_update(&hashContext, buffer, count) != 0)
+            {
+                Serial.println("[OTA] ERROR: SHA-256 update failed.");
                 downloadSucceeded = false;
                 break;
             }
 
             received += count;
+            if (received >= nextProgressLog)
+            {
+                Serial.printf("[OTA] Download progress: %u / %u bytes\n",
+                              static_cast<unsigned int>(received),
+                              static_cast<unsigned int>(firmwareSize));
+                nextProgressLog += kProgressLogIntervalBytes;
+            }
             yield();
         }
 
-        unsigned char actualHash[32];
+        unsigned char actualHash[32] = {0};
         const bool hashSucceeded =
             mbedtls_sha256_finish(&hashContext, actualHash) == 0;
         mbedtls_sha256_free(&hashContext);
+
+        Serial.printf("[OTA] Download succeeded: %s\n",
+                      downloadSucceeded ? "YES" : "NO");
+        Serial.printf("[OTA] Bytes received: %u\n",
+                      static_cast<unsigned int>(received));
+        Serial.printf("[OTA] Expected bytes: %u\n",
+                      static_cast<unsigned int>(firmwareSize));
+        Serial.printf("[OTA] SHA-256 calculation: %s\n",
+                      hashSucceeded ? "SUCCESS" : "FAILED");
+
+        const bool hashMatches =
+            hashSucceeded &&
+            sodium_memcmp(actualHash, expectedHash, sizeof(actualHash)) == 0;
+        Serial.printf("[OTA] SHA-256 match: %s\n",
+                      hashMatches ? "YES" : "NO");
+
         http.end();
 
-        if (
-            !downloadSucceeded ||
+        if (!downloadSucceeded ||
             received != firmwareSize ||
             !hashSucceeded ||
-            sodium_memcmp(actualHash, expectedHash, sizeof(actualHash)) != 0)
+            !hashMatches)
         {
             Update.abort();
+            Serial.println("[OTA] ERROR: Firmware size or SHA-256 verification failed.");
             failureMessage =
                 "The downloaded firmware failed size or SHA-256 verification.";
             return false;
@@ -385,11 +460,14 @@ namespace
         reportStatus("verifying", version);
         if (!Update.end())
         {
+            Serial.printf("[OTA] ERROR: Update.end failed: %s\n",
+                          Update.errorString());
             failureMessage = String("ESP32 rejected the firmware image: ") +
                              Update.errorString();
             return false;
         }
 
+        Serial.println("[OTA] Firmware image verified and written successfully.");
         reportStatus("rebooting", version);
         delay(300);
         ESP.restart();
