@@ -24,7 +24,7 @@ namespace
 #endif
     constexpr char kApPassword[] = BOARD_AP_PASSWORD;
     constexpr char kPreferencesNamespace[] = "wifi";
-    constexpr char kFirmwareVersion[] = "1.0.0";
+    constexpr char kFirmwareVersion[] = "1.0.1";
 
     constexpr char kBackendHost[] = "smart-notice-board-api.onrender.com";
     constexpr uint16_t kBackendPort = 443;
@@ -629,7 +629,7 @@ namespace
             ssid.isEmpty() ||
             ssid.length() > 32 ||
             (!password.isEmpty() &&
-                (password.length() < 8 || password.length() > 63)))
+             (password.length() < 8 || password.length() > 63)))
         {
             reportFailure();
             return;
@@ -943,9 +943,134 @@ namespace
 
     void handleRoot()
     {
-        addCorsHeaders();
-        server.send(200, "text/plain", "Smart Notice Board is online!");
-        Serial.println("Root endpoint accessed");
+        const char html[] = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Smart Notice Board Setup</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f2f5f9;
+            padding: 25px;
+            text-align: center;
+        }
+        .container {
+            max-width: 400px;
+            margin: 30px auto;
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 3px 12px #ccc;
+        }
+        input, button {
+            width: 100%;
+            padding: 12px;
+            margin: 10px 0;
+            box-sizing: border-box;
+            border-radius: 6px;
+        }
+        input {
+            border: 1px solid #ccc;
+        }
+        button {
+            background: #1769aa;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        #status {
+            margin-top: 15px;
+            overflow-wrap: anywhere;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>Smart Notice Board</h2>
+    <p>Connect your ESP32 to Wi-Fi</p>
+
+    <form id="wifiForm">
+        <input id="ssid" type="text"
+            placeholder="Wi-Fi Network Name (SSID)"
+            maxlength="32" required>
+
+        <input id="password" type="password"
+            placeholder="Wi-Fi Password" maxlength="63">
+
+        <button type="submit">Connect to Wi-Fi</button>
+    </form>
+
+    <p id="status">Checking device status...</p>
+</div>
+
+<script>
+const statusElement = document.getElementById("status");
+
+async function checkStatus() {
+    try {
+        const response = await fetch("/status");
+        const data = await response.json();
+
+        if (data.connected) {
+            statusElement.textContent =
+                "Connected to " + data.ssid +
+                " | IP: " + data.ip;
+        } else if (data.connecting) {
+            statusElement.textContent =
+                "Connecting to Wi-Fi...";
+        } else {
+            statusElement.textContent =
+                "Setup Access Point is ready. Configure Wi-Fi.";
+        }
+    } catch (error) {
+        statusElement.textContent = "Unable to read device status.";
+    }
+}
+
+document.getElementById("wifiForm").addEventListener(
+    "submit", async function(event) {
+        event.preventDefault();
+
+        const ssid = document.getElementById("ssid").value.trim();
+        const password = document.getElementById("password").value;
+
+        statusElement.textContent = "Sending Wi-Fi details...";
+
+        try {
+            const response = await fetch("/connect", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ ssid, password })
+            });
+
+            const result = await response.json();
+
+            statusElement.textContent =
+                result.message || "Request completed.";
+
+            if (response.ok) {
+                setTimeout(checkStatus, 2000);
+            }
+        } catch (error) {
+            statusElement.textContent =
+                "Connection request failed. Check the device.";
+        }
+    }
+);
+
+checkStatus();
+setInterval(checkStatus, 3000);
+</script>
+</body>
+</html>
+)HTML";
+
+        server.send(200, "text/html", html);
+        Serial.println("WiFi setup page opened");
     }
 
     void handleStatus()
@@ -1224,7 +1349,6 @@ namespace
                 Serial.println("Retrying saved WiFi connection");
             }
         }
-
     }
 
 } // namespace

@@ -7,4 +7,4 @@
 
 // Configure with the 32-byte Ed25519 public key in lowercase or uppercase hex.
 // OTA fails closed while this placeholder is empty.
-#define BOARD_OTA_ED25519_PUBLIC_KEY_HEX ""
+#define BOARD_OTA_ED25519_PUBLIC_KEY_HEX "73d954f5590cfc0fda105647ff4c0969033f4b2876380c9e559722a98915cb2c"
