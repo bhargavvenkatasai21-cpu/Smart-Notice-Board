@@ -140,36 +140,59 @@ namespace
 
     bool fetchManifest(String &manifest)
     {
+        Serial.println("[OTA] Preparing secure manifest connection...");
+
         WiFiClientSecure client;
         client.setCACert(kTrustedCaCertificates);
 
         HTTPClient http;
         http.setTimeout(kRequestTimeoutMs);
-        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
         http.setRedirectLimit(kMaximumHttpRedirects);
+
+        Serial.println("[OTA] Opening manifest URL...");
+
         if (!http.begin(client, BOARD_OTA_MANIFEST_URL))
         {
+            Serial.println("[OTA] ERROR: HTTP begin failed.");
             return false;
         }
 
+        Serial.println("[OTA] Sending manifest GET request...");
+
         const int statusCode = http.GET();
+
+        Serial.printf("[OTA] HTTP status: %d\n", statusCode);
+
         if (statusCode != HTTP_CODE_OK)
         {
+            Serial.println("[OTA] ERROR: Manifest request failed.");
             http.end();
             return false;
         }
 
         const int contentLength = http.getSize();
+
+        Serial.printf("[OTA] Manifest size: %d bytes\n", contentLength);
+
         if (
             contentLength <= 0 ||
             static_cast<size_t>(contentLength) > kMaximumManifestBytes)
         {
+            Serial.println("[OTA] ERROR: Invalid manifest size.");
             http.end();
             return false;
         }
 
+        Serial.println("[OTA] Reading manifest...");
+
         manifest = http.getString();
+
+        Serial.printf("[OTA] Manifest received: %u bytes\n",
+                      static_cast<unsigned int>(manifest.length()));
+
         http.end();
+
         return !manifest.isEmpty() &&
                manifest.length() <= kMaximumManifestBytes;
     }
@@ -252,9 +275,9 @@ namespace
         }
 
         String signedContent = String(kSignatureContext) +
-                              manifestVersion + "\n" +
-                              String(static_cast<unsigned long long>(declaredSize)) + "\n" +
-                              hashHex + "\n" + firmwareUrl;
+                               manifestVersion + "\n" +
+                               String(static_cast<unsigned long long>(declaredSize)) + "\n" +
+                               hashHex + "\n" + firmwareUrl;
         if (sodium_init() < 0 ||
             crypto_sign_ed25519_verify_detached(
                 signature,

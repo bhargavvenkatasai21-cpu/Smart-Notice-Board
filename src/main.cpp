@@ -28,7 +28,7 @@ namespace
 #endif
     constexpr char kApPassword[] = BOARD_AP_PASSWORD;
     constexpr char kPreferencesNamespace[] = "wifi";
-    constexpr char kFirmwareVersion[] = "1.0.0";
+    constexpr char kFirmwareVersion[] = "1.0.1";
 
     constexpr char kBackendHost[] = "smart-notice-board-api.onrender.com";
     constexpr uint16_t kBackendPort = 443;
