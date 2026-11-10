@@ -28,7 +28,7 @@ namespace
 #endif
     constexpr char kApPassword[] = BOARD_AP_PASSWORD;
     constexpr char kPreferencesNamespace[] = "wifi";
-    constexpr char kFirmwareVersion[] = "1.0.2";
+    constexpr char kFirmwareVersion[] = "1.0.3";
 
     constexpr char kBackendHost[] = "smart-notice-board-api.onrender.com";
     constexpr uint16_t kBackendPort = 443;
@@ -1032,7 +1032,7 @@ namespace
 
     void handleRoot()
     {
-        const char html[] = R"HTML(
+        static const char html[] = R"HTML(
 <!DOCTYPE html>
 <html>
 <head>
@@ -1223,11 +1223,11 @@ document.getElementById("noticeForm").addEventListener(
             const result = await response.text();
 
             if (!response.ok) {
-                throw new Error(result || "Unable to send notice.");
+                throw new Error(result.message || "Unable to send notice.");
             }
 
             noticeStatus.textContent =
-                result || "Notice sent successfully.";
+                result.message || "Notice sent successfully.";
 
         } catch (error) {
             noticeStatus.textContent =

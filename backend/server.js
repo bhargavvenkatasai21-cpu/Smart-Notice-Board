@@ -845,7 +845,7 @@ app.post(
                 delivered: true,
                 requestId,
                 ...noticeRecord,
-                message: "ESP32 acknowledged the notice command. Physical LCD output cannot be verified remotely."
+                message: "ESP32 acknowledged the notice command. You can see the physical LCD output for verification."
             });
         } catch (error) {
             console.error("Notice delivery failed:", error.message);
