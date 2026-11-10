@@ -245,7 +245,7 @@ namespace
 
         const String expectedUrl =
             String(BOARD_OTA_RELEASE_ASSET_PREFIX) +
-            "v" + manifestVersion + "/firmware.bin";
+            "V" + manifestVersion + "/firmware.bin";
         unsigned char signature[crypto_sign_BYTES];
         if (
             firmwareUrl != expectedUrl ||

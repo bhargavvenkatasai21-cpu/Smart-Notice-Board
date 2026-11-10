@@ -1,7 +1,7 @@
 #pragma once
 
 #define BOARD_OTA_MANIFEST_URL \
-    "https://github.com/bhargavvenkatasai21-cpu/Smart-Notice-Board/releases/latest/download/manifest.json"
+    "https://github.com/bhargavvenkatasai21-cpu/Smart-Notice-Board/releases/download/V1.0.2/manifest-1.0.2.json"
 #define BOARD_OTA_RELEASE_ASSET_PREFIX \
     "https://github.com/bhargavvenkatasai21-cpu/Smart-Notice-Board/releases/download/"
 

@@ -28,7 +28,7 @@ namespace
 #endif
     constexpr char kApPassword[] = BOARD_AP_PASSWORD;
     constexpr char kPreferencesNamespace[] = "wifi";
-    constexpr char kFirmwareVersion[] = "1.0.1";
+    constexpr char kFirmwareVersion[] = "1.0.2";
 
     constexpr char kBackendHost[] = "smart-notice-board-api.onrender.com";
     constexpr uint16_t kBackendPort = 443;
@@ -1053,15 +1053,20 @@ namespace
             border-radius: 12px;
             box-shadow: 0 3px 12px #ccc;
         }
-        input, button {
+        input, textarea, button {
             width: 100%;
             padding: 12px;
             margin: 10px 0;
             box-sizing: border-box;
             border-radius: 6px;
+            font-family: Arial, sans-serif;
         }
-        input {
+        input, textarea {
             border: 1px solid #ccc;
+        }
+        textarea {
+            resize: vertical;
+            min-height: 100px;
         }
         button {
             background: #1769aa;
@@ -1069,9 +1074,18 @@ namespace
             border: none;
             cursor: pointer;
         }
-        #status {
+        button:disabled {
+            background: #999;
+            cursor: not-allowed;
+        }
+        #status, #noticeStatus {
             margin-top: 15px;
             overflow-wrap: anywhere;
+        }
+        .notice-section {
+            margin-top: 25px;
+            padding-top: 15px;
+            border-top: 1px solid #ddd;
         }
     </style>
 </head>
@@ -1092,10 +1106,33 @@ namespace
     </form>
 
     <p id="status">Checking device status...</p>
+
+    <div class="notice-section">
+        <h3>Send a Notice</h3>
+        <p>Enter a message to display on the LCD.</p>
+
+        <form id="noticeForm">
+            <textarea
+                id="notice"
+                placeholder="Type your notice here..."
+                maxlength="200"
+                required
+            ></textarea>
+
+            <p id="characterCount">0/200 characters</p>
+
+            <button id="sendNoticeButton" type="submit">
+                Send Notice
+            </button>
+        </form>
+
+        <p id="noticeStatus" role="status"></p>
+    </div>
 </div>
 
 <script>
 const statusElement = document.getElementById("status");
+const noticeStatus = document.getElementById("noticeStatus");
 
 async function checkStatus() {
     try {
@@ -1147,6 +1184,56 @@ document.getElementById("wifiForm").addEventListener(
         } catch (error) {
             statusElement.textContent =
                 "Connection request failed. Check the device.";
+        }
+    }
+);
+
+const noticeInput = document.getElementById("notice");
+const characterCount = document.getElementById("characterCount");
+const sendNoticeButton = document.getElementById("sendNoticeButton");
+
+noticeInput.addEventListener("input", function() {
+    characterCount.textContent =
+        noticeInput.value.length + "/200 characters";
+});
+
+document.getElementById("noticeForm").addEventListener(
+    "submit", async function(event) {
+        event.preventDefault();
+
+        const notice = noticeInput.value.trim();
+
+        if (!notice) {
+            noticeStatus.textContent = "Please enter a notice.";
+            return;
+        }
+
+        sendNoticeButton.disabled = true;
+        noticeStatus.textContent = "Sending notice...";
+
+        try {
+            const response = await fetch("/notice", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ notice })
+            });
+
+            const result = await response.text();
+
+            if (!response.ok) {
+                throw new Error(result || "Unable to send notice.");
+            }
+
+            noticeStatus.textContent =
+                result || "Notice sent successfully.";
+
+        } catch (error) {
+            noticeStatus.textContent =
+                error.message || "Failed to send notice.";
+        } finally {
+            sendNoticeButton.disabled = false;
         }
     }
 );

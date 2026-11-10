@@ -124,7 +124,7 @@ def sign_release(firmware_path, version, private_key_path, output_path):
     sha256 = hashlib.sha256(firmware_bytes).hexdigest()
     firmware_url = (
         f"https://github.com/{REPOSITORY}/releases/download/"
-        f"v{version}/firmware.bin"
+        f"V{version}/firmware.bin"
     )
     signed_content = build_signed_message(
         version,
