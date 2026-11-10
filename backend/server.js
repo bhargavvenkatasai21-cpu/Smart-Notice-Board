@@ -215,6 +215,22 @@ const wss = new WebSocket.Server({
     maxPayload: 4096
 });
 
+// Check ESP32 connection every 15 seconds.
+const heartbeatInterval = setInterval(() => {
+    if (!connectedDevice) return;
+
+    if (connectedDevice.readyState !== WebSocket.OPEN) return;
+
+    if (connectedDevice.isAlive === false) {
+        console.log("ESP32 heartbeat timeout. Terminating connection.");
+        connectedDevice.terminate();
+        return;
+    }
+
+    connectedDevice.isAlive = false;
+    connectedDevice.ping();
+}, 5000);
+
 let connectedDevice = null;
 let latestNotice = null;
 let lastDeviceCommunicationAt = null;
@@ -729,7 +745,7 @@ wss.on("connection", (ws) => {
         if (
             activeFirmwareUpdateId &&
             firmwareUpdateOperations.get(activeFirmwareUpdateId)?.state !==
-                "rebooting"
+            "rebooting"
         ) {
             const operation = firmwareUpdateOperations.get(activeFirmwareUpdateId);
             if (operation?.device === ws) {
