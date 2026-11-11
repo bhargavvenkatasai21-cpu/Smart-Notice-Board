@@ -297,7 +297,7 @@ const wss = new WebSocket.Server({
     maxPayload: 4096
 });
 
-// Check ESP32 connection every 15 seconds.
+// Check ESP32 connection every 5 seconds.
 const heartbeatInterval = setInterval(() => {
     if (!connectedDevice) return;
 

@@ -35,8 +35,8 @@ function dashboardHeaders(extra = {}) {
     };
 }
 
-async function connectDevice() {
-    const socket = new WebSocket(`${baseUrl.replace("http", "ws")}/ws`);
+async function connectDevice(options = {}) {
+    const socket = new WebSocket(`${baseUrl.replace("http", "ws")}/ws`, options);
     const authenticated = new Promise((resolve, reject) => {
         const timeout = setTimeout(
             () => reject(new Error("WebSocket authentication timed out")),
@@ -246,6 +246,43 @@ test("status accurately reports a disconnected device", async () => {
     assert.equal(status.connected, false);
     assert.equal(status.websocketConnected, false);
     assert.equal(status.latestNotice, null);
+});
+
+test("heartbeat marks a silent ESP32 offline and accepts a reconnect", async () => {
+    const silentSocket = await connectDevice({ autoPong: false });
+    const statusUrl = `${baseUrl}/api/device/status`;
+    const readStatus = async () => {
+        const response = await fetch(statusUrl, {
+            headers: dashboardHeaders()
+        });
+        assert.equal(response.status, 200);
+        return response.json();
+    };
+
+    assert.equal((await readStatus()).connected, true);
+
+    const offlineDeadline = Date.now() + 12000;
+    let status;
+    do {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        status = await readStatus();
+    } while (status.connected && Date.now() < offlineDeadline);
+
+    assert.equal(status.connected, false, "heartbeat should detect the silent device within 12 seconds");
+    assert.equal(status.websocketConnected, false);
+    assert.ok(status.lastSeenAt, "last communication remains available as historical data");
+    assert.equal(silentSocket.readyState, WebSocket.CLOSED);
+
+    const reconnectedSocket = await connectDevice();
+    status = await readStatus();
+    assert.equal(status.connected, true);
+    assert.equal(status.websocketConnected, true);
+
+    reconnectedSocket.close();
+    await new Promise((resolve) => reconnectedSocket.once("close", resolve));
+    status = await readStatus();
+    assert.equal(status.connected, false);
+    assert.equal(status.websocketConnected, false);
 });
 
 test("notice requests validate content and report a disconnected device", async () => {
@@ -775,7 +812,7 @@ test("authenticated ESP32 receives notices and confirms delivery", async () => {
     assert.equal(typeof deliveredMessage.id, "string");
     assert.equal(result.success, true);
     assert.equal(result.delivered, true);
-    assert.match(result.message, /Physical LCD output cannot be verified/);
+    assert.match(result.message, /acknowledged the notice command/);
 
     const statusResponse = await fetch(`${baseUrl}/api/device/status`, {
         headers: dashboardHeaders()

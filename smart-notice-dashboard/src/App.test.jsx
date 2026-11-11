@@ -165,6 +165,39 @@ describe("Dashboard authentication and local provisioning", () => {
     expect(window.localStorage.length).toBe(0);
   });
 
+  it("refreshes device and WebSocket status automatically while backend stays online", async () => {
+    getDashboardSession.mockResolvedValue({
+      success: true,
+      expiresAt: "2026-11-09T00:00:00.000Z",
+    });
+    getDeviceStatus
+      .mockResolvedValueOnce(remoteConnected)
+      .mockResolvedValue({
+        ...remoteConnected,
+        connected: false,
+        websocketConnected: false,
+      });
+
+    render(<App />);
+
+    expect(await screen.findByText("Connected to the backend")).toBeInTheDocument();
+    expect(screen.getByText("ESP32").parentElement).toHaveTextContent("Online");
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("ESP32").parentElement).toHaveTextContent("Offline");
+        expect(screen.getByText("WebSocket").parentElement).toHaveTextContent("Offline");
+      },
+      { interval: 100, timeout: 8000 },
+    );
+
+    expect(screen.getByText("Backend").parentElement).toHaveTextContent("Online");
+    expect(getDeviceStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("Last device communication").parentElement).toHaveTextContent(
+      new Date(remoteConnected.lastSeenAt).toLocaleString(),
+    );
+  }, 10000);
+
   it("keeps a valid session authenticated when device-status polling fails", async () => {
     getDashboardSession.mockResolvedValue({
       success: true,

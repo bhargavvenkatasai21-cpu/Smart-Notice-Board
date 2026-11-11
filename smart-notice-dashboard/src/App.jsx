@@ -30,7 +30,7 @@ const INITIAL_WIFI_STATUS = {
   savedCredentials: false,
   connectionError: "",
 };
-const STATUS_POLL_INTERVAL_MS = 15000;
+const STATUS_POLL_INTERVAL_MS = 5000;
 const LOCAL_SETUP_AVAILABLE =
   import.meta.env?.DEV &&
   typeof window !== "undefined" &&

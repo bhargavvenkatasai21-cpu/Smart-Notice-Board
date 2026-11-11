@@ -44,7 +44,7 @@ The following software checks were run for the current changes on 2026-11-10.
 | Dashboard lint | PASS | `npm run lint` |
 | Dashboard production build | PASS | `npm run build` |
 | OTA signer and helper tests | PASS — 15 tests | |
-| PlatformIO firmware build | PASS | Compiled `esp32dev` with `BOARD_FIRMWARE_VERSION=1.0.3`, `1.0.10`, and `1.0.4`; the latest build used 85.3% of the configured application partition and 15.7% of RAM. No board was flashed. |
+| PlatformIO firmware build | PASS | Compiled `esp32dev` with `BOARD_FIRMWARE_VERSION=1.0.3`, `1.0.10`, and `1.0.4`; the latest OTA downloader build used 85.4% of the configured application partition and 15.7% of RAM. No board was flashed. |
 | Firmware version metadata validation | PASS | Numeric versions compiled without firmware source edits; an invalid prerelease version was rejected. |
 | Firmware OTA/network runtime | NOT RUN | Requires device/release/network integration; compilation does not validate physical behavior. |
 | Published stable release integrity | PASS | Queried GitHub latest: `V1.0.3` is stable, assets are `firmware.bin` and `manifest-1.0.3.json`; downloaded image size (1,297,616 bytes), SHA-256, and Ed25519 signature all match the manifest. |
