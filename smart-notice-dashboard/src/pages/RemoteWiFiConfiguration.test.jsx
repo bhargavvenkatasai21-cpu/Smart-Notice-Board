@@ -7,6 +7,7 @@ import {
   getRemoteWifiConfiguration,
   getRemoteWifiForget,
   startRemoteWifiConfiguration,
+  startFirmwareCheck,
   startFirmwareUpdate,
   startRemoteWifiForget,
 } from "../services/esp32Service.js";
@@ -16,6 +17,7 @@ vi.mock("../services/esp32Service.js", () => ({
   getRemoteWifiConfiguration: vi.fn(),
   getRemoteWifiForget: vi.fn(),
   startRemoteWifiConfiguration: vi.fn(),
+  startFirmwareCheck: vi.fn(),
   startFirmwareUpdate: vi.fn(),
   startRemoteWifiForget: vi.fn(),
 }));
@@ -43,7 +45,6 @@ describe("remote ESP32 Wi-Fi configuration", () => {
       <RemoteWiFiConfiguration
         deviceConnected
         onConfigured={onConfigured}
-        sessionToken="session-token"
         wifiStatus={{ connected: false }}
       />,
     );
@@ -63,12 +64,10 @@ describe("remote ESP32 Wi-Fi configuration", () => {
     ).toBeInTheDocument();
 
     expect(startRemoteWifiConfiguration).toHaveBeenCalledWith(
-      "session-token",
       "Office WiFi",
       "password123",
     );
     expect(getRemoteWifiConfiguration).toHaveBeenCalledWith(
-      "session-token",
       "request-123",
     );
     expect(onConfigured).toHaveBeenCalledOnce();
@@ -83,7 +82,6 @@ describe("remote ESP32 Wi-Fi configuration", () => {
       <RemoteWiFiConfiguration
         deviceConnected={false}
         onConfigured={vi.fn()}
-        sessionToken="session-token"
         wifiStatus={{ connected: false }}
       />,
     );
@@ -107,7 +105,6 @@ describe("remote ESP32 Wi-Fi configuration", () => {
       <RemoteWiFiConfiguration
         deviceConnected
         onConfigured={vi.fn()}
-        sessionToken="session-token"
         wifiStatus={{ connected: false }}
       />,
     );
@@ -138,7 +135,6 @@ describe("remote ESP32 Wi-Fi configuration", () => {
       <RemoteWiFiConfiguration
         deviceConnected
         onConfigured={onConfigured}
-        sessionToken="session-token"
         wifiStatus={{
           connected: true,
           rssi: -61,
@@ -167,32 +163,40 @@ describe("remote ESP32 Wi-Fi configuration", () => {
         { timeout: 3000 },
       ),
     ).toBeInTheDocument();
-    expect(startRemoteWifiForget).toHaveBeenCalledWith("session-token");
+    expect(startRemoteWifiForget).toHaveBeenCalledWith();
     expect(getRemoteWifiForget).toHaveBeenCalledWith(
-      "session-token",
       "forget-123",
     );
     expect(onConfigured).toHaveBeenCalledOnce();
   });
 
-  it("reports OTA success only after the ESP32 reconnects with the new version", async () => {
+  it("checks a release separately and installs only after explicit selection", async () => {
     const user = userEvent.setup();
     const onConfigured = vi.fn().mockResolvedValue(undefined);
-    startFirmwareUpdate.mockResolvedValue({
+    startFirmwareCheck.mockResolvedValue({
       requestId: "firmware-123",
       state: "command_sent",
     });
-    getFirmwareUpdate.mockResolvedValue({
-      requestId: "firmware-123",
-      state: "verified",
-      version: "1.0.1",
+    startFirmwareUpdate.mockResolvedValue({
+      requestId: "install-123",
+      state: "command_sent",
     });
+    getFirmwareUpdate
+      .mockResolvedValueOnce({
+        requestId: "firmware-123",
+        state: "available",
+        version: "1.0.1",
+      })
+      .mockResolvedValueOnce({
+        requestId: "install-123",
+        state: "verified",
+        version: "1.0.1",
+      });
 
     render(
       <RemoteWiFiConfiguration
         deviceConnected
         onConfigured={onConfigured}
-        sessionToken="session-token"
         wifiStatus={{ connected: true, firmwareVersion: "1.0.0" }}
       />,
     );
@@ -200,17 +204,70 @@ describe("remote ESP32 Wi-Fi configuration", () => {
       screen.getByRole("button", { name: "Check for signed update" }),
     );
     expect(
+      await screen.findByRole("button", { name: "Install v1.0.1" }, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(startFirmwareCheck).toHaveBeenCalledWith();
+    expect(startFirmwareUpdate).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Install v1.0.1" }));
+    expect(
       await screen.findByText(
         /reconnected with the updated firmware/,
         {},
         { timeout: 3000 },
       ),
     ).toBeInTheDocument();
-    expect(startFirmwareUpdate).toHaveBeenCalledWith("session-token");
+    expect(startFirmwareUpdate).toHaveBeenCalledWith(false);
     expect(getFirmwareUpdate).toHaveBeenCalledWith(
-      "session-token",
-      "firmware-123",
+      "install-123",
     );
     expect(onConfigured).toHaveBeenCalledOnce();
+  });
+
+  it("requires a separate confirmation to reinstall the current firmware", async () => {
+    const user = userEvent.setup();
+    startFirmwareCheck.mockResolvedValue({
+      requestId: "check-123",
+      state: "command_sent",
+    });
+    startFirmwareUpdate.mockResolvedValue({
+      requestId: "install-123",
+      state: "command_sent",
+    });
+    getFirmwareUpdate
+      .mockResolvedValueOnce({
+        requestId: "check-123",
+        state: "up_to_date",
+        version: "1.0.3",
+      })
+      .mockResolvedValueOnce({
+        requestId: "install-123",
+        state: "verified",
+        version: "1.0.3",
+      });
+
+    render(
+      <RemoteWiFiConfiguration
+        deviceConnected
+        onConfigured={vi.fn().mockResolvedValue(undefined)}
+        wifiStatus={{ connected: true, firmwareVersion: "1.0.3" }}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Check for signed update" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Reinstall current firmware" }, {
+        timeout: 3000,
+      }),
+    );
+    expect(startFirmwareUpdate).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Confirm reinstall" }));
+
+    expect(startFirmwareUpdate).toHaveBeenCalledWith(true);
+    expect(
+      await screen.findByText(/reconnected with the updated firmware/, {}, {
+        timeout: 3000,
+      }),
+    ).toBeInTheDocument();
   });
 });

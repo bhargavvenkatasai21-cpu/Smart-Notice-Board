@@ -6,12 +6,11 @@ import {
   connectWiFi,
   createDashboardSession,
   getBackendHealth,
+  getDashboardSession,
   getDeviceStatus,
   getESP32Address,
-  getRemoteWifiConfiguration,
   getStatus,
   logoutDashboardSession,
-  startRemoteWifiConfiguration,
 } from "./services/esp32Service.js";
 
 vi.mock("./services/esp32Service.js", () => ({
@@ -19,6 +18,7 @@ vi.mock("./services/esp32Service.js", () => ({
   createDashboardSession: vi.fn(),
   disconnectWiFi: vi.fn(),
   getBackendHealth: vi.fn(),
+  getDashboardSession: vi.fn(),
   getDeviceStatus: vi.fn(),
   getESP32Address: vi.fn(),
   getRemoteWifiConfiguration: vi.fn(),
@@ -27,7 +27,6 @@ vi.mock("./services/esp32Service.js", () => ({
   reconnectWiFi: vi.fn(),
   sendNotice: vi.fn(),
   setESP32Address: vi.fn((address) => address),
-  startRemoteWifiConfiguration: vi.fn(),
 }));
 
 const localDisconnected = {
@@ -48,7 +47,14 @@ const remoteConnected = {
   latestNotice: { notice: "Meeting at 10", sentAt: "2026-11-08T10:00:00.000Z" },
 };
 
-describe("Dashboard backend integration and local provisioning", () => {
+function unauthorizedSessionError(code = "session_missing") {
+  const error = new Error("Dashboard sign-in is required.");
+  error.status = 401;
+  error.code = code;
+  return error;
+}
+
+describe("Dashboard authentication and local provisioning", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
@@ -57,11 +63,11 @@ describe("Dashboard backend integration and local provisioning", () => {
       status: "OK",
       service: "Smart Notice Board Backend",
     });
-    createDashboardSession.mockImplementation(async (accessCode, rememberMe) => ({
+    getDashboardSession.mockRejectedValue(unauthorizedSessionError());
+    createDashboardSession.mockResolvedValue({
       success: true,
-      sessionToken: "test-session-token",
-      expiresAt: rememberMe ? "2026-12-08T00:00:00.000Z" : "2026-11-09T00:00:00.000Z",
-    }));
+      expiresAt: "2026-11-09T00:00:00.000Z",
+    });
     getDeviceStatus.mockResolvedValue({ connected: false });
     logoutDashboardSession.mockResolvedValue({ success: true });
     getStatus.mockResolvedValue(localDisconnected);
@@ -70,20 +76,36 @@ describe("Dashboard backend integration and local provisioning", () => {
     });
   });
 
-  it("checks backend availability on load without assuming the ESP32 is online", async () => {
+  it("checks backend availability without requesting protected status before sign-in", async () => {
     render(<App />);
 
+    expect(await screen.findByLabelText("Dashboard access code")).toBeInTheDocument();
     await waitFor(() => expect(getBackendHealth).toHaveBeenCalled());
-    expect(await screen.findByText("Online")).toBeInTheDocument();
     expect(screen.getByText("Sign in to check device status")).toBeInTheDocument();
+    expect(getDashboardSession).toHaveBeenCalledOnce();
     expect(getDeviceStatus).not.toHaveBeenCalled();
+  });
+
+  it("waits for cookie-session initialization before rendering the login route", async () => {
+    let finishInitialization;
+    getDashboardSession.mockReturnValue(
+      new Promise((resolve) => {
+        finishInitialization = resolve;
+      }),
+    );
+    render(<App />);
+
+    expect(screen.getByText("Checking dashboard session…")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Dashboard access code")).not.toBeInTheDocument();
+    finishInitialization({ success: true, expiresAt: "2026-11-09T00:00:00.000Z" });
+    expect(await screen.findByRole("button", { name: "Sign out" })).toBeInTheDocument();
   });
 
   it("rejects an empty access code without contacting the backend", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "Sign in" }));
+    await user.click(await screen.findByRole("button", { name: "Sign in" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Enter the dashboard access code.",
@@ -91,148 +113,122 @@ describe("Dashboard backend integration and local provisioning", () => {
     expect(createDashboardSession).not.toHaveBeenCalled();
   });
 
-  it("authenticates with the backend and shows its device and WebSocket status", async () => {
+  it("authenticates and shows device status without exposing a session token", async () => {
     const user = userEvent.setup();
     getDeviceStatus.mockResolvedValue(remoteConnected);
     render(<App />);
 
-    await user.type(screen.getByLabelText("Dashboard access code"), "operator-code");
+    await user.type(await screen.findByLabelText("Dashboard access code"), "operator-code");
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
     expect(createDashboardSession).toHaveBeenCalledWith("operator-code", false);
-    expect(getDeviceStatus).toHaveBeenCalledWith("test-session-token");
+    expect(getDeviceStatus).toHaveBeenCalledWith();
     expect(await screen.findByText("Connected to the backend")).toBeInTheDocument();
     expect(screen.getByText("Device-to-backend channel")).toBeInTheDocument();
     expect(screen.getByText("WebSocket").parentElement).toHaveTextContent("Online");
     expect(screen.getByText("Last device communication").parentElement).toHaveTextContent(
       new Date(remoteConnected.lastSeenAt).toLocaleString(),
     );
-    expect(screen.getByText("Meeting at 10")).toBeInTheDocument();
+    expect(await screen.findByText("Meeting at 10")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+    expect(window.localStorage.length).toBe(0);
   });
 
-  it("shows remote Wi-Fi configuration only after dashboard sign-in", async () => {
-    const user = userEvent.setup();
-    getDeviceStatus.mockResolvedValue(remoteConnected);
-    render(<App />);
-
-    expect(
-      screen.queryByRole("button", { name: "Wi-Fi configuration" }),
-    ).not.toBeInTheDocument();
-
-    await user.type(screen.getByLabelText("Dashboard access code"), "operator-code");
-    await user.click(screen.getByRole("button", { name: "Sign in" }));
-    await user.click(
-      await screen.findByRole("button", { name: "Wi-Fi configuration" }),
-    );
-
-    expect(
-      await screen.findByRole("heading", { name: "ESP32 Wi-Fi configuration" }),
-    ).toBeInTheDocument();
-    expect(startRemoteWifiConfiguration).not.toHaveBeenCalled();
-    expect(getRemoteWifiConfiguration).not.toHaveBeenCalled();
-  });
-
-  it("does not persist a session when Remember me is unchecked", async () => {
+  it("passes Remember me to the server without storing the cookie token in browser storage", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.type(screen.getByLabelText("Dashboard access code"), "one-time-code");
-    expect(screen.getByRole("checkbox", { name: /Remember me/ })).not.toBeChecked();
-    await user.click(screen.getByRole("button", { name: "Sign in" }));
-
-    expect(await screen.findByRole("button", { name: "Sign out" })).toBeInTheDocument();
-    expect(window.localStorage.getItem("smart-notice-board-dashboard-session")).toBeNull();
-  });
-
-  it("persists only the session token after successful login when Remember me is selected", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-
-    await user.type(screen.getByLabelText("Dashboard access code"), "remembered-code");
+    await user.type(await screen.findByLabelText("Dashboard access code"), "remembered-code");
     await user.click(screen.getByRole("checkbox", { name: /Remember me/ }));
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
     expect(await screen.findByRole("button", { name: "Sign out" })).toBeInTheDocument();
     expect(createDashboardSession).toHaveBeenCalledWith("remembered-code", true);
-    expect(getDeviceStatus).toHaveBeenCalledWith("test-session-token");
-    expect(
-      window.localStorage.getItem("smart-notice-board-dashboard-session"),
-    ).toBe("test-session-token");
-    expect(window.localStorage.getItem("smart-notice-board-dashboard-token")).toBeNull();
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
   });
 
-  it("automatically restores and verifies a remembered session on startup", async () => {
-    window.localStorage.setItem(
-      "smart-notice-board-dashboard-session",
-      "restored-session",
-    );
+  it("restores a valid cookie session on refresh or in a new tab", async () => {
+    getDashboardSession.mockResolvedValue({
+      success: true,
+      expiresAt: "2026-11-09T00:00:00.000Z",
+    });
     getDeviceStatus.mockResolvedValue(remoteConnected);
 
     render(<App />);
 
-    expect(getDeviceStatus).toHaveBeenCalledWith("restored-session");
-    expect(await screen.findByText("Connected to the backend")).toBeInTheDocument();
-    expect(screen.getByText("Meeting at 10")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Sign out" })).toBeInTheDocument();
+    expect(getDashboardSession).toHaveBeenCalledOnce();
+    expect(getDeviceStatus).toHaveBeenCalledWith();
+    expect(await screen.findByText("Meeting at 10")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Dashboard access code")).not.toBeInTheDocument();
+    expect(window.localStorage.length).toBe(0);
+  });
+
+  it("keeps a valid session authenticated when device-status polling fails", async () => {
+    getDashboardSession.mockResolvedValue({
+      success: true,
+      expiresAt: "2026-11-09T00:00:00.000Z",
+    });
+    getDeviceStatus.mockRejectedValue(new Error("Device status unavailable"));
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Sign out" })).toBeInTheDocument();
+    expect(await screen.findByText("Device status unavailable")).toBeInTheDocument();
     expect(screen.queryByLabelText("Dashboard access code")).not.toBeInTheDocument();
   });
 
-  it("removes old remembered API tokens without treating them as sessions", async () => {
-    window.localStorage.setItem("smart-notice-board-dashboard-token", "legacy-token");
+  it("shows a clear message when the cookie session has expired", async () => {
+    getDashboardSession.mockRejectedValue(unauthorizedSessionError("session_invalid"));
 
     render(<App />);
 
+    expect(await screen.findByText(/session expired or is no longer valid/i)).toBeInTheDocument();
     expect(await screen.findByLabelText("Dashboard access code")).toBeInTheDocument();
-    expect(window.localStorage.getItem("smart-notice-board-dashboard-token")).toBeNull();
     expect(getDeviceStatus).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["invalid", "Unauthorized"],
-    ["expired", "Dashboard token expired"],
-  ])("removes an %s remembered session rejected by the backend", async (_kind, message) => {
-    const error = new Error(message);
-    error.status = 401;
-    getDeviceStatus.mockRejectedValue(error);
-    window.localStorage.setItem(
-      "smart-notice-board-dashboard-session",
-      "rejected-session",
-    );
+  it("keeps protected routes unavailable while session initialization fails", async () => {
+    getDashboardSession.mockRejectedValue(new Error("Backend unavailable"));
 
     render(<App />);
 
-    expect(await screen.findByText(/session is no longer valid/)).toBeInTheDocument();
-    expect(await screen.findByLabelText("Dashboard access code")).toBeInTheDocument();
-    expect(window.localStorage.getItem("smart-notice-board-dashboard-session")).toBeNull();
-    expect(screen.getByRole("checkbox", { name: /Remember me/ })).not.toBeChecked();
+    expect(await screen.findByRole("heading", { name: "Unable to verify dashboard session" }))
+      .toBeInTheDocument();
+    expect(screen.queryByLabelText("Dashboard access code")).not.toBeInTheDocument();
+    expect(screen.getByText("Backend unavailable")).toBeInTheDocument();
   });
 
-  it("revokes and removes a remembered session on logout", async () => {
+  it("revokes the server session on logout", async () => {
     const user = userEvent.setup();
+    getDashboardSession.mockResolvedValue({
+      success: true,
+      expiresAt: "2026-11-09T00:00:00.000Z",
+    });
     getDeviceStatus.mockResolvedValue(remoteConnected);
-    window.localStorage.setItem(
-      "smart-notice-board-dashboard-session",
-      "saved-session",
-    );
 
     render(<App />);
-    await screen.findByRole("button", { name: "Sign out" });
-    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    await user.click(await screen.findByRole("button", { name: "Sign out" }));
 
     expect(await screen.findByLabelText("Dashboard access code")).toBeInTheDocument();
-    expect(window.localStorage.getItem("smart-notice-board-dashboard-session")).toBeNull();
-    expect(logoutDashboardSession).toHaveBeenCalledWith("saved-session");
+    expect(logoutDashboardSession).toHaveBeenCalledWith();
+    expect(window.localStorage.length).toBe(0);
   });
 
-  it("reports invalid dashboard credentials without exposing a false device status", async () => {
+  it("reports invalid dashboard credentials without exposing device status", async () => {
     const user = userEvent.setup();
+    createDashboardSession.mockRejectedValue(
+      new Error("Incorrect dashboard access code."),
+    );
     render(<App />);
 
-    createDashboardSession.mockRejectedValue(new Error("Incorrect dashboard access code."));
-    await user.type(screen.getByLabelText("Dashboard access code"), "bad-code");
+    await user.type(await screen.findByLabelText("Dashboard access code"), "bad-code");
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Incorrect dashboard access code.");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Incorrect dashboard access code.",
+    );
     expect(screen.getByText("Sign in to check device status")).toBeInTheDocument();
   });
 
@@ -240,15 +236,12 @@ describe("Dashboard backend integration and local provisioning", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "Device setup" }));
+    await user.click(await screen.findByRole("button", { name: "Device setup" }));
     expect(
       await screen.findByRole("heading", { name: "Wi-Fi configuration" }),
     ).toBeInTheDocument();
 
-    await user.type(
-      screen.getByLabelText("Wi-Fi network name (SSID)"),
-      "Home WiFi",
-    );
+    await user.type(screen.getByLabelText("Wi-Fi network name (SSID)"), "Home WiFi");
     await user.type(screen.getByLabelText("Wi-Fi password"), "password123");
     await user.click(screen.getByRole("button", { name: "Connect to Wi-Fi" }));
 

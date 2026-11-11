@@ -4,6 +4,7 @@ import {
   getRemoteWifiConfiguration,
   getRemoteWifiForget,
   startRemoteWifiConfiguration,
+  startFirmwareCheck,
   startFirmwareUpdate,
   startRemoteWifiForget,
 } from "../services/esp32Service.js";
@@ -12,6 +13,7 @@ const TERMINAL_STATES = new Set(["authenticated", "failed", "timed_out"]);
 const FORGET_TERMINAL_STATES = new Set(["deleted", "failed", "timed_out"]);
 const FIRMWARE_TERMINAL_STATES = new Set([
   "verified",
+  "available",
   "up_to_date",
   "failed",
   "timed_out",
@@ -40,8 +42,9 @@ const FORGET_OPERATION_LABELS = {
 };
 
 const FIRMWARE_OPERATION_LABELS = {
-  command_sent: "Sending firmware update request…",
+  command_sent: "Sending firmware operation to the ESP32…",
   checking: "Checking the signed GitHub firmware release…",
+  available: "A newer signed firmware release is available.",
   downloading: "Downloading firmware over verified HTTPS…",
   verifying: "Verifying the signed firmware image…",
   rebooting: "Firmware installed; waiting for the ESP32 to reconnect…",
@@ -62,7 +65,6 @@ function waitForNextPoll() {
 }
 
 function RemoteWiFiConfiguration({
-  sessionToken,
   deviceConnected,
   wifiStatus,
   onConfigured,
@@ -78,6 +80,7 @@ function RemoteWiFiConfiguration({
   const [confirmingForget, setConfirmingForget] = useState(false);
   const [firmwareOperation, setFirmwareOperation] = useState(null);
   const [firmwareError, setFirmwareError] = useState("");
+  const [confirmingReinstall, setConfirmingReinstall] = useState(false);
   const submitting = useRef(false);
 
   const handleSubmit = async (event) => {
@@ -90,7 +93,6 @@ function RemoteWiFiConfiguration({
 
     try {
       const started = await startRemoteWifiConfiguration(
-        sessionToken,
         ssid,
         password,
       );
@@ -98,7 +100,6 @@ function RemoteWiFiConfiguration({
       for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt += 1) {
         await waitForNextPoll();
         latestOperation = await getRemoteWifiConfiguration(
-          sessionToken,
           started.requestId,
         );
         setOperation(latestOperation);
@@ -133,12 +134,11 @@ function RemoteWiFiConfiguration({
     setForgetError("");
 
     try {
-      const started = await startRemoteWifiForget(sessionToken);
+      const started = await startRemoteWifiForget();
       let latestOperation = null;
       for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt += 1) {
         await waitForNextPoll();
         latestOperation = await getRemoteWifiForget(
-          sessionToken,
           started.requestId,
         );
         setForgetOperation(latestOperation);
@@ -168,7 +168,7 @@ function RemoteWiFiConfiguration({
     }
   };
 
-  const handleFirmwareUpdate = async () => {
+  const handleFirmwareCheck = async () => {
     if (submitting.current) return;
     submitting.current = true;
     setBusy(true);
@@ -176,14 +176,49 @@ function RemoteWiFiConfiguration({
     setFirmwareError("");
 
     try {
-      const started = await startFirmwareUpdate(sessionToken);
+      const started = await startFirmwareCheck();
       let latestOperation = null;
       for (let attempt = 0; attempt < MAX_FIRMWARE_POLL_ATTEMPTS; attempt += 1) {
         await waitForNextPoll();
         latestOperation = await getFirmwareUpdate(
-          sessionToken,
           started.requestId,
         );
+        setFirmwareOperation(latestOperation);
+        if (FIRMWARE_TERMINAL_STATES.has(latestOperation.state)) break;
+      }
+
+      if (latestOperation?.state === "failed" || latestOperation?.state === "timed_out") {
+        setFirmwareError(
+          latestOperation.message || FIRMWARE_OPERATION_LABELS[latestOperation.state],
+        );
+      } else if (!["available", "up_to_date"].includes(latestOperation?.state)) {
+        setFirmwareError(
+          "The ESP32 has not confirmed the release check. Check its status before trying again.",
+        );
+      }
+    } catch (requestError) {
+      setFirmwareError(
+        requestError.message || "Unable to check for ESP32 firmware updates.",
+      );
+    } finally {
+      setBusy(false);
+      submitting.current = false;
+    }
+  };
+
+  const handleFirmwareInstall = async (allowReinstall = false) => {
+    if (submitting.current) return;
+    submitting.current = true;
+    setBusy(true);
+    setFirmwareOperation(null);
+    setFirmwareError("");
+
+    try {
+      const started = await startFirmwareUpdate(allowReinstall);
+      let latestOperation = null;
+      for (let attempt = 0; attempt < MAX_FIRMWARE_POLL_ATTEMPTS; attempt += 1) {
+        await waitForNextPoll();
+        latestOperation = await getFirmwareUpdate(started.requestId);
         setFirmwareOperation(latestOperation);
         if (FIRMWARE_TERMINAL_STATES.has(latestOperation.state)) break;
       }
@@ -199,15 +234,16 @@ function RemoteWiFiConfiguration({
         );
       } else if (latestOperation?.state !== "up_to_date") {
         setFirmwareError(
-          "The ESP32 has not confirmed the update. Check its status before trying again.",
+          "The ESP32 has not confirmed installation. Check its status before trying again.",
         );
       }
     } catch (requestError) {
       setFirmwareError(
-        requestError.message || "Unable to update ESP32 firmware.",
+        requestError.message || "Unable to install ESP32 firmware.",
       );
     } finally {
       setBusy(false);
+      setConfirmingReinstall(false);
       submitting.current = false;
     }
   };
@@ -397,17 +433,62 @@ function RemoteWiFiConfiguration({
           <div className="firmware-update-controls">
             <h4>Firmware updates</h4>
             <p>
-              Only newer releases with a valid Ed25519 signature are installed.
-              The ESP32 reboots and confirms its version after reconnecting.
+              Check the latest stable signed release first. Installation is a
+              separate action; reinstalling the same version requires explicit
+              confirmation. Older versions are always rejected.
             </p>
             <button
               className="secondary-button"
               disabled={busy || !deviceConnected}
-              onClick={() => void handleFirmwareUpdate()}
+              onClick={() => void handleFirmwareCheck()}
               type="button"
             >
               {busy ? "Firmware operation in progress…" : "Check for signed update"}
             </button>
+            {firmwareOperation?.state === "available" && (
+              <button
+                className="primary-button"
+                disabled={busy || !deviceConnected}
+                onClick={() => void handleFirmwareInstall()}
+                type="button"
+              >
+                Install v{firmwareOperation.version}
+              </button>
+            )}
+            {firmwareOperation?.state === "up_to_date" && !confirmingReinstall && (
+              <button
+                className="secondary-button"
+                disabled={busy || !deviceConnected}
+                onClick={() => setConfirmingReinstall(true)}
+                type="button"
+              >
+                Reinstall current firmware
+              </button>
+            )}
+            {confirmingReinstall && (
+              <div>
+                <p className="feedback warning" role="status">
+                  This will intentionally reinstall the same signed firmware
+                  version and reboot the ESP32.
+                </p>
+                <button
+                  className="secondary-button"
+                  disabled={busy || !deviceConnected}
+                  onClick={() => void handleFirmwareInstall(true)}
+                  type="button"
+                >
+                  {busy ? "Reinstalling…" : "Confirm reinstall"}
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={busy}
+                  onClick={() => setConfirmingReinstall(false)}
+                  type="button"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
             {firmwareOperation && (
               <p
                 className={`feedback ${

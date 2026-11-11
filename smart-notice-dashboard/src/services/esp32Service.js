@@ -77,7 +77,7 @@ function getBackendUrl() {
   }
 }
 
-async function requestBackend(path, { sessionToken, ...options } = {}) {
+async function requestBackend(path, options = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(
     () => controller.abort(),
@@ -87,15 +87,13 @@ async function requestBackend(path, { sessionToken, ...options } = {}) {
     Accept: "application/json",
     ...options.headers,
   };
-  if (sessionToken) {
-    headers.Authorization = `Bearer ${sessionToken}`;
-  }
 
   let response;
   try {
     response = await fetch(`${getBackendUrl()}${path}`, {
       ...options,
       headers,
+      credentials: "include",
       signal: controller.signal,
       cache: "no-store",
     });
@@ -132,6 +130,7 @@ async function requestBackend(path, { sessionToken, ...options } = {}) {
         : `Backend request failed with HTTP ${response.status}.`;
     const error = new Error(message);
     error.status = response.status;
+    if (typeof data?.code === "string") error.code = data.code;
     throw error;
   }
 
@@ -157,35 +156,32 @@ export async function createDashboardSession(accessCode, rememberMe = false) {
   });
   if (
     session?.success !== true ||
-    typeof session.sessionToken !== "string" ||
-    !session.sessionToken
+    typeof session.expiresAt !== "string"
   ) {
     throw new Error("The backend did not create a valid dashboard session.");
   }
   return session;
 }
 
-export async function logoutDashboardSession(sessionToken) {
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("A dashboard session is required to sign out.");
+export async function getDashboardSession() {
+  const session = await requestBackend("/api/auth/session", { method: "GET" });
+  if (session?.success !== true || typeof session.expiresAt !== "string") {
+    throw new Error("The backend did not return a valid dashboard session.");
   }
-  const result = await requestBackend("/api/auth/logout", {
-    method: "POST",
-    sessionToken,
-  });
+  return session;
+}
+
+export async function logoutDashboardSession() {
+  const result = await requestBackend("/api/auth/logout", { method: "POST" });
   if (result?.success !== true) {
     throw new Error("The backend did not confirm the dashboard sign-out.");
   }
   return result;
 }
 
-export async function getDeviceStatus(sessionToken) {
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("Sign in with the dashboard access code first.");
-  }
+export async function getDeviceStatus() {
   const status = await requestBackend("/api/device/status", {
     method: "GET",
-    sessionToken,
   });
   if (typeof status?.connected !== "boolean") {
     throw new Error("The backend returned an invalid device status response.");
@@ -215,19 +211,11 @@ function validateRemoteWifiConfiguration(ssid, password) {
   }
 }
 
-export async function startRemoteWifiConfiguration(
-  sessionToken,
-  ssid,
-  password,
-) {
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("Sign in before configuring ESP32 Wi-Fi.");
-  }
+export async function startRemoteWifiConfiguration(ssid, password) {
   validateRemoteWifiConfiguration(ssid, password);
 
   const result = await requestBackend("/api/device/wifi-config", {
     method: "POST",
-    sessionToken,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ssid: ssid.trim(), password }),
   });
@@ -243,17 +231,14 @@ export async function startRemoteWifiConfiguration(
   return result;
 }
 
-export async function getRemoteWifiConfiguration(sessionToken, requestId) {
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("Sign in before checking Wi-Fi configuration.");
-  }
+export async function getRemoteWifiConfiguration(requestId) {
   if (typeof requestId !== "string" || !requestId.trim()) {
     throw new Error("A Wi-Fi configuration request ID is required.");
   }
 
   const result = await requestBackend(
     `/api/device/wifi-config/${encodeURIComponent(requestId)}`,
-    { method: "GET", sessionToken },
+    { method: "GET" },
   );
   const operation = result?.operation;
   if (
@@ -274,14 +259,9 @@ export async function getRemoteWifiConfiguration(sessionToken, requestId) {
   return operation;
 }
 
-export async function startRemoteWifiForget(sessionToken) {
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("Sign in before deleting ESP32 Wi-Fi credentials.");
-  }
-
+export async function startRemoteWifiForget() {
   const result = await requestBackend("/api/device/wifi-forget", {
     method: "POST",
-    sessionToken,
   });
   if (
     result?.success !== true ||
@@ -295,17 +275,14 @@ export async function startRemoteWifiForget(sessionToken) {
   return result;
 }
 
-export async function getRemoteWifiForget(sessionToken, requestId) {
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("Sign in before checking Wi-Fi credential deletion.");
-  }
+export async function getRemoteWifiForget(requestId) {
   if (typeof requestId !== "string" || !requestId.trim()) {
     throw new Error("A Wi-Fi deletion request ID is required.");
   }
 
   const result = await requestBackend(
     `/api/device/wifi-forget/${encodeURIComponent(requestId)}`,
-    { method: "GET", sessionToken },
+    { method: "GET" },
   );
   const operation = result?.operation;
   if (
@@ -320,14 +297,11 @@ export async function getRemoteWifiForget(sessionToken, requestId) {
   return operation;
 }
 
-export async function startFirmwareUpdate(sessionToken) {
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("Sign in before requesting a firmware update.");
-  }
-
+export async function startFirmwareUpdate(allowReinstall = false) {
   const result = await requestBackend("/api/device/firmware-update", {
     method: "POST",
-    sessionToken,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ allowReinstall }),
   });
   if (
     result?.success !== true ||
@@ -341,17 +315,30 @@ export async function startFirmwareUpdate(sessionToken) {
   return result;
 }
 
-export async function getFirmwareUpdate(sessionToken, requestId) {
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("Sign in before checking the firmware update.");
+export async function startFirmwareCheck() {
+  const result = await requestBackend("/api/device/firmware-check", {
+    method: "POST",
+  });
+  if (
+    result?.success !== true ||
+    typeof result.requestId !== "string" ||
+    result.state !== "command_sent"
+  ) {
+    throw new Error(
+      result?.message || "The backend did not accept the firmware check request.",
+    );
   }
+  return result;
+}
+
+export async function getFirmwareUpdate(requestId) {
   if (typeof requestId !== "string" || !requestId.trim()) {
     throw new Error("A firmware update request ID is required.");
   }
 
   const result = await requestBackend(
     `/api/device/firmware-update/${encodeURIComponent(requestId)}`,
-    { method: "GET", sessionToken },
+    { method: "GET" },
   );
   const operation = result?.operation;
   if (
@@ -360,6 +347,7 @@ export async function getFirmwareUpdate(sessionToken, requestId) {
     ![
       "command_sent",
       "checking",
+      "available",
       "downloading",
       "verifying",
       "rebooting",
@@ -572,20 +560,15 @@ export async function reconnectWiFi() {
   return requestAt(discovery.reachableAddress, "/reconnect", { method: "POST" });
 }
 
-export async function sendNotice(notice, sessionToken) {
+export async function sendNotice(notice) {
   if (typeof notice !== "string" || !notice.trim()) {
     throw new Error("Enter a notice before sending.");
   }
   if (notice.length > MAX_NOTICE_LENGTH) {
     throw new Error("Notices cannot exceed 200 characters.");
   }
-  if (typeof sessionToken !== "string" || !sessionToken.trim()) {
-    throw new Error("Sign in before sending a notice.");
-  }
-
   const result = await requestBackend("/api/notices", {
     method: "POST",
-    sessionToken,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ notice: notice.trim() }),
   });

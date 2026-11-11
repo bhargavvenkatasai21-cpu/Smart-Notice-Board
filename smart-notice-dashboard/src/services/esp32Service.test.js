@@ -6,6 +6,7 @@ import {
   disconnectWiFi,
   getFirmwareUpdate,
   getBackendHealth,
+  getDashboardSession,
   getDeviceStatus,
   getESP32Address,
   getRemoteWifiConfiguration,
@@ -273,7 +274,7 @@ describe("status and notice API", () => {
     globalThis.fetch = vi.fn(async () => jsonResponse(response, 202));
 
     await expect(
-      startRemoteWifiConfiguration("session-token", " Office WiFi ", "password123"),
+      startRemoteWifiConfiguration(" Office WiFi ", "password123"),
     ).resolves.toEqual(response);
 
     expect(fetch).toHaveBeenCalledWith(
@@ -281,9 +282,9 @@ describe("status and notice API", () => {
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({
-          Authorization: "Bearer session-token",
           "Content-Type": "application/json",
         }),
+        credentials: "include",
         body: JSON.stringify({ ssid: "Office WiFi", password: "password123" }),
       }),
     );
@@ -293,13 +294,13 @@ describe("status and notice API", () => {
 
   it("validates remote network credentials before sending them", async () => {
     await expect(
-      startRemoteWifiConfiguration("session-token", "  ", "password123"),
+      startRemoteWifiConfiguration("  ", "password123"),
     ).rejects.toThrow(/network name/);
     await expect(
-      startRemoteWifiConfiguration("session-token", "Office", "short"),
+      startRemoteWifiConfiguration("Office", "short"),
     ).rejects.toThrow(/between 8 and 63 UTF-8 bytes/);
     await expect(
-      startRemoteWifiConfiguration("session-token", "☃".repeat(11), "password123"),
+      startRemoteWifiConfiguration("☃".repeat(11), "password123"),
     ).rejects.toThrow(/32 UTF-8 bytes/);
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -316,15 +317,13 @@ describe("status and notice API", () => {
     globalThis.fetch = vi.fn(async () => jsonResponse(response));
 
     await expect(
-      getRemoteWifiConfiguration("session-token", "request-123"),
+      getRemoteWifiConfiguration("request-123"),
     ).resolves.toEqual(response.operation);
     expect(fetch).toHaveBeenCalledWith(
       `${BACKEND}/api/device/wifi-config/request-123`,
       expect.objectContaining({
         method: "GET",
-        headers: expect.objectContaining({
-          Authorization: "Bearer session-token",
-        }),
+        credentials: "include",
       }),
     );
   });
@@ -338,7 +337,7 @@ describe("status and notice API", () => {
     );
 
     await expect(
-      getRemoteWifiConfiguration("session-token", "request-123"),
+      getRemoteWifiConfiguration("request-123"),
     ).rejects.toThrow(/invalid Wi-Fi operation status/);
   });
 
@@ -350,17 +349,14 @@ describe("status and notice API", () => {
     };
     globalThis.fetch = vi.fn(async () => jsonResponse(response, 202));
 
-    await expect(startRemoteWifiForget("session-token")).resolves.toEqual(response);
+    await expect(startRemoteWifiForget()).resolves.toEqual(response);
     expect(fetch).toHaveBeenCalledWith(
       `${BACKEND}/api/device/wifi-forget`,
       expect.objectContaining({
         method: "POST",
-        headers: expect.objectContaining({
-          Authorization: expect.any(String),
-        }),
+        credentials: "include",
       }),
     );
-    expect(fetch.mock.calls[0][1]).not.toHaveProperty("body");
     expect(window.localStorage.length).toBe(0);
     expect(window.sessionStorage.length).toBe(0);
   });
@@ -377,15 +373,13 @@ describe("status and notice API", () => {
     globalThis.fetch = vi.fn(async () => jsonResponse(response));
 
     await expect(
-      getRemoteWifiForget("session-token", "forget-123"),
+      getRemoteWifiForget("forget-123"),
     ).resolves.toEqual(response.operation);
     expect(fetch).toHaveBeenCalledWith(
       `${BACKEND}/api/device/wifi-forget/forget-123`,
       expect.objectContaining({
         method: "GET",
-        headers: expect.objectContaining({
-          Authorization: expect.any(String),
-        }),
+        credentials: "include",
       }),
     );
   });
@@ -398,17 +392,15 @@ describe("status and notice API", () => {
     };
     globalThis.fetch = vi.fn(async () => jsonResponse(response, 202));
 
-    await expect(startFirmwareUpdate("session-token")).resolves.toEqual(response);
+    await expect(startFirmwareUpdate()).resolves.toEqual(response);
     expect(fetch).toHaveBeenCalledWith(
       `${BACKEND}/api/device/firmware-update`,
       expect.objectContaining({
         method: "POST",
-        headers: expect.objectContaining({
-          Authorization: expect.any(String),
-        }),
+        credentials: "include",
+        body: JSON.stringify({ allowReinstall: false }),
       }),
     );
-    expect(fetch.mock.calls[0][1]).not.toHaveProperty("body");
   });
 
   it("polls a firmware update and validates the operation state", async () => {
@@ -423,15 +415,13 @@ describe("status and notice API", () => {
     globalThis.fetch = vi.fn(async () => jsonResponse(response));
 
     await expect(
-      getFirmwareUpdate("session-token", "firmware-123"),
+      getFirmwareUpdate("firmware-123"),
     ).resolves.toEqual(response.operation);
     expect(fetch).toHaveBeenCalledWith(
       `${BACKEND}/api/device/firmware-update/firmware-123`,
       expect.objectContaining({
         method: "GET",
-        headers: expect.objectContaining({
-          Authorization: expect.any(String),
-        }),
+        credentials: "include",
       }),
     );
 
@@ -442,14 +432,13 @@ describe("status and notice API", () => {
       }),
     );
     await expect(
-      getFirmwareUpdate("session-token", "firmware-123"),
+      getFirmwareUpdate("firmware-123"),
     ).rejects.toThrow(/invalid firmware update status/);
   });
 
   it("exchanges the access code for a backend session", async () => {
     const session = {
       success: true,
-      sessionToken: "opaque-session-token",
       expiresAt: "2026-11-09T00:00:00.000Z",
     };
     globalThis.fetch = vi.fn(async () => jsonResponse(session));
@@ -460,8 +449,23 @@ describe("status and notice API", () => {
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({ "Content-Type": "application/json" }),
+        credentials: "include",
         body: JSON.stringify({ accessCode: "access-code", rememberMe: true }),
       }),
+    );
+  });
+
+  it("restores an existing cookie-backed dashboard session", async () => {
+    const session = {
+      success: true,
+      expiresAt: "2026-11-09T00:00:00.000Z",
+    };
+    globalThis.fetch = vi.fn(async () => jsonResponse(session));
+
+    await expect(getDashboardSession()).resolves.toEqual(session);
+    expect(fetch).toHaveBeenCalledWith(
+      `${BACKEND}/api/auth/session`,
+      expect.objectContaining({ method: "GET", credentials: "include" }),
     );
   });
 
@@ -475,16 +479,14 @@ describe("status and notice API", () => {
   it("revokes the backend session on logout", async () => {
     globalThis.fetch = vi.fn(async () => jsonResponse({ success: true }));
 
-    await expect(logoutDashboardSession("session-token")).resolves.toEqual({
+    await expect(logoutDashboardSession()).resolves.toEqual({
       success: true,
     });
     expect(fetch).toHaveBeenCalledWith(
       `${BACKEND}/api/auth/logout`,
       expect.objectContaining({
         method: "POST",
-        headers: expect.objectContaining({
-          Authorization: "Bearer session-token",
-        }),
+        credentials: "include",
       }),
     );
   });
@@ -497,16 +499,14 @@ describe("status and notice API", () => {
     );
 
     await expect(getBackendHealth()).resolves.toMatchObject({ status: "OK" });
-    await expect(getDeviceStatus("session-token")).resolves.toMatchObject({
+    await expect(getDeviceStatus()).resolves.toMatchObject({
       connected: false,
     });
     expect(fetch.mock.calls.map(([url]) => url)).toEqual([
       `${BACKEND}/api/health`,
       `${BACKEND}/api/device/status`,
     ]);
-    expect(fetch.mock.calls[1][1].headers.Authorization).toBe(
-      "Bearer session-token",
-    );
+    expect(fetch.mock.calls[1][1].credentials).toBe("include");
   });
 
   it("preserves HTTP 401 status for invalid or expired dashboard sessions", async () => {
@@ -514,7 +514,7 @@ describe("status and notice API", () => {
       jsonResponse({ success: false, message: "Unauthorized" }, 401),
     );
 
-    await expect(getDeviceStatus("stale-session")).rejects.toMatchObject({
+    await expect(getDeviceStatus()).rejects.toMatchObject({
       message: "Unauthorized",
       status: 401,
     });
@@ -549,7 +549,7 @@ describe("status and notice API", () => {
     globalThis.fetch = vi.fn(async () =>
       jsonResponse({ message: `server error ${code}` }, code),
     );
-    await expect(sendNotice("Meeting", "session-token")).rejects.toThrow(
+    await expect(sendNotice("Meeting")).rejects.toThrow(
       `server error ${code}`,
     );
   });
@@ -562,7 +562,7 @@ describe("status and notice API", () => {
     };
     globalThis.fetch = vi.fn(async () => jsonResponse(result));
 
-    await expect(sendNotice(" Meeting at 10 ", "session-token")).resolves.toEqual(
+    await expect(sendNotice(" Meeting at 10 ")).resolves.toEqual(
       result,
     );
     expect(fetch).toHaveBeenCalledWith(
@@ -570,7 +570,6 @@ describe("status and notice API", () => {
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({
-          Authorization: "Bearer session-token",
           "Content-Type": "application/json",
         }),
         body: JSON.stringify({ notice: "Meeting at 10" }),
@@ -582,7 +581,7 @@ describe("status and notice API", () => {
     globalThis.fetch = vi.fn(async () =>
       jsonResponse({ success: true, message: "Notice queued" }),
     );
-    await expect(sendNotice("Meeting", "session-token")).rejects.toThrow(
+    await expect(sendNotice("Meeting")).rejects.toThrow(
       /Notice queued/,
     );
   });
@@ -592,20 +591,19 @@ describe("status and notice API", () => {
       jsonResponse({ success: true, delivered: true, message: "Acknowledged" }),
     );
     const notice = "x".repeat(200);
-    await expect(sendNotice(notice, "session-token")).resolves.toMatchObject({
+    await expect(sendNotice(notice)).resolves.toMatchObject({
       delivered: true,
     });
     expect(JSON.parse(fetch.mock.calls[0][1].body).notice).toHaveLength(200);
   });
 
-  it("rejects empty, overlength, and unauthenticated notices without a request", async () => {
-    await expect(sendNotice("  ", "session-token")).rejects.toThrow(
+  it("rejects empty and overlength notices without a request", async () => {
+    await expect(sendNotice("  ")).rejects.toThrow(
       /Enter a notice/,
     );
     await expect(
-      sendNotice("x".repeat(201), "session-token"),
+      sendNotice("x".repeat(201)),
     ).rejects.toThrow(/cannot exceed 200/);
-    await expect(sendNotice("Meeting", "")).rejects.toThrow(/Sign in/);
     expect(fetch).not.toHaveBeenCalled();
   });
 

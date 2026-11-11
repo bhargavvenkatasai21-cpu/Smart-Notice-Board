@@ -10,6 +10,7 @@ import {
   createDashboardSession,
   disconnectWiFi,
   getBackendHealth,
+  getDashboardSession,
   getDeviceStatus,
   getESP32Address,
   getStatus,
@@ -30,17 +31,6 @@ const INITIAL_WIFI_STATUS = {
   connectionError: "",
 };
 const STATUS_POLL_INTERVAL_MS = 15000;
-const DASHBOARD_SESSION_STORAGE_KEY = "smart-notice-board-dashboard-session";
-const LEGACY_DASHBOARD_TOKEN_STORAGE_KEY = "smart-notice-board-dashboard-token";
-
-function getSavedDashboardSession() {
-  try {
-    window.localStorage.removeItem(LEGACY_DASHBOARD_TOKEN_STORAGE_KEY);
-    return window.localStorage.getItem(DASHBOARD_SESSION_STORAGE_KEY) || "";
-  } catch {
-    return "";
-  }
-}
 const LOCAL_SETUP_AVAILABLE =
   import.meta.env?.DEV &&
   typeof window !== "undefined" &&
@@ -54,10 +44,12 @@ function formatLastCommunication(value) {
 
 function App() {
   const [page, setPage] = useState("dashboard");
-  const [dashboardSession, setDashboardSession] = useState(getSavedDashboardSession);
+  const [dashboardAuthenticated, setDashboardAuthenticated] = useState(false);
+  const [authInitialized, setAuthInitialized] = useState(false);
+  const [authInitializationError, setAuthInitializationError] = useState("");
   const [accessCodeInput, setAccessCodeInput] = useState("");
   const [showAccessCode, setShowAccessCode] = useState(false);
-  const [rememberSession, setRememberSession] = useState(() => Boolean(getSavedDashboardSession()));
+  const [rememberSession, setRememberSession] = useState(false);
   const [authError, setAuthError] = useState("");
   const [authNotice, setAuthNotice] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
@@ -72,14 +64,54 @@ function App() {
   const [connectionFeedback, setConnectionFeedback] = useState(null);
   const [deviceAddress, setDeviceAddress] = useState(getESP32Address);
   const statusRequestId = useRef(0);
+  const authInitializationId = useRef(0);
+
+  const initializeAuthentication = useCallback(async () => {
+    const requestId = ++authInitializationId.current;
+    try {
+      await getDashboardSession();
+      if (requestId !== authInitializationId.current) return;
+      setDashboardAuthenticated(true);
+      setAuthNotice("");
+      setAuthInitializationError("");
+    } catch (error) {
+      if (requestId !== authInitializationId.current) return;
+      if (error?.status === 401) {
+        setDashboardAuthenticated(false);
+        setDeviceStatus(null);
+        if (error.code === "session_invalid") {
+          setAuthNotice("Your dashboard session expired or is no longer valid. Sign in again.");
+        }
+      } else {
+        setAuthInitializationError(
+          error?.message || "Unable to verify the dashboard session.",
+        );
+      }
+    } finally {
+      if (requestId === authInitializationId.current) {
+        setAuthInitialized(true);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (active) void initializeAuthentication();
+    });
+    return () => {
+      active = false;
+      authInitializationId.current += 1;
+    };
+  }, [initializeAuthentication]);
 
   const refreshBackendStatus = useCallback(
-    async (sessionToken = dashboardSession) => {
+    async (isAuthenticated = dashboardAuthenticated) => {
       const requestId = ++statusRequestId.current;
       setStatusBusy(true);
       const [healthResult, deviceResult] = await Promise.allSettled([
         getBackendHealth(),
-        sessionToken ? getDeviceStatus(sessionToken) : Promise.resolve(null),
+        isAuthenticated ? getDeviceStatus() : Promise.resolve(null),
       ]);
 
       const currentStatus = {
@@ -105,7 +137,7 @@ function App() {
         setBackendError(healthResult.reason?.message || "Backend is unavailable.");
       }
 
-      if (!sessionToken) {
+      if (!isAuthenticated) {
         setDeviceStatus(null);
         setDeviceError("");
       } else if (deviceResult.status === "fulfilled") {
@@ -115,17 +147,10 @@ function App() {
         setDeviceStatus(null);
         setDeviceError(deviceResult.reason?.message || "Device status is unavailable.");
         if (deviceResult.reason?.status === 401) {
-          setDashboardSession("");
+          setDashboardAuthenticated(false);
           setRememberSession(false);
           setAccessCodeInput("");
-          setAuthError("The saved dashboard session is no longer valid. Enter the access code again.");
-          try {
-            window.localStorage.removeItem(DASHBOARD_SESSION_STORAGE_KEY);
-          } catch {
-            setAuthError(
-              "The saved dashboard session is no longer valid. Clear this site's local storage, then enter the access code again.",
-            );
-          }
+          setAuthNotice("Your dashboard session expired or is no longer valid. Sign in again.");
           setDeviceStatus(null);
           setDeviceError("");
         }
@@ -134,10 +159,11 @@ function App() {
       setStatusBusy(false);
       return currentStatus;
     },
-    [dashboardSession],
+    [dashboardAuthenticated],
   );
 
   useEffect(() => {
+    if (!authInitialized) return undefined;
     let timerId;
     let cancelled = false;
 
@@ -153,7 +179,7 @@ function App() {
       cancelled = true;
       window.clearTimeout(timerId);
     };
-  }, [refreshBackendStatus]);
+  }, [authInitialized, refreshBackendStatus]);
 
   const refreshLocalStatus = useCallback(async () => {
     try {
@@ -182,32 +208,13 @@ function App() {
     setAuthError("");
     setAuthNotice("");
     try {
-      const session = await createDashboardSession(candidate, rememberSession);
-      const status = await getDeviceStatus(session.sessionToken);
-      setDashboardSession(session.sessionToken);
-      if (rememberSession) {
-        try {
-          window.localStorage.setItem(
-            DASHBOARD_SESSION_STORAGE_KEY,
-            session.sessionToken,
-          );
-        } catch {
-          setRememberSession(false);
-          setAuthNotice(
-            "Signed in, but this browser could not save the session. You will need to enter the access code again next time.",
-          );
-        }
-      } else {
-        try {
-          window.localStorage.removeItem(DASHBOARD_SESSION_STORAGE_KEY);
-        } catch {
-          // Continue without remembering the token.
-        }
-      }
-      setAccessCodeInput("");
-      setDeviceStatus(status);
-      setDeviceError("");
-      setPage("dashboard");
+    await createDashboardSession(candidate, rememberSession);
+    setDashboardAuthenticated(true);
+    setAuthInitializationError("");
+    setAccessCodeInput("");
+    setDeviceStatus(null);
+    setDeviceError("");
+    setPage("dashboard");
     } catch (error) {
       setAuthError(error.message || "Dashboard authentication failed.");
     } finally {
@@ -216,28 +223,20 @@ function App() {
   };
 
   const handleLogout = async () => {
-    const sessionToken = dashboardSession;
-    setDashboardSession("");
-    setRememberSession(false);
-    setAuthNotice("");
     setAuthError("");
     try {
-      window.localStorage.removeItem(DASHBOARD_SESSION_STORAGE_KEY);
-    } catch {
-      setAuthError(
-        "Signed out, but the remembered session could not be removed. Clear this site's local storage.",
+      await logoutDashboardSession();
+      setDashboardAuthenticated(false);
+      setRememberSession(false);
+      setAuthNotice("");
+      setDeviceStatus(null);
+      setDeviceError("");
+    } catch (error) {
+      setAuthNotice(
+        error?.message
+          ? `Could not revoke the dashboard session: ${error.message}`
+          : "Could not revoke the dashboard session. You remain signed in; try signing out again.",
       );
-    }
-    setDeviceStatus(null);
-    setDeviceError("");
-    if (sessionToken) {
-      try {
-        await logoutDashboardSession(sessionToken);
-      } catch {
-        setAuthNotice(
-          "Signed out in this browser, but the backend session could not be revoked. It will expire automatically.",
-        );
-      }
     }
   };
 
@@ -251,7 +250,7 @@ function App() {
         ? `Cannot verify ESP32 status: ${currentStatus.deviceError}`
         : "The ESP32 is disconnected. Reconnect it before sending a notice.");
     }
-    const result = await sendNotice(notice, dashboardSession);
+    const result = await sendNotice(notice);
     await refreshBackendStatus();
     return result;
   };
@@ -315,7 +314,7 @@ function App() {
   };
 
   const deviceConnected = deviceStatus?.connected === true;
-  const deviceNeedsLogin = !dashboardSession;
+  const deviceNeedsLogin = !dashboardAuthenticated;
 
   return (
     <div className="dashboard">
@@ -329,10 +328,10 @@ function App() {
           <Navbar
             activePage={page}
             showSetup={LOCAL_SETUP_AVAILABLE}
-            showRemoteWifi={Boolean(dashboardSession)}
+            showRemoteWifi={dashboardAuthenticated}
             onNavigate={handleNavigate}
           />
-          {dashboardSession && (
+          {dashboardAuthenticated && (
             <button className="text-button logout-button" onClick={handleLogout} type="button">
               Sign out
             </button>
@@ -400,14 +399,33 @@ function App() {
 
         {page === "setup" && LOCAL_SETUP_AVAILABLE ? (
           <WiFiSettings {...localWifiProps} />
-        ) : page === "wifi" && dashboardSession ? (
+        ) : !authInitialized ? (
+          <section className="card access-card" role="status">
+            Checking dashboard session…
+          </section>
+        ) : authInitializationError ? (
+          <section className="card access-card" aria-labelledby="session-error-title">
+            <h3 id="session-error-title">Unable to verify dashboard session</h3>
+            <p className="feedback error" role="alert">{authInitializationError}</p>
+            <button
+              className="secondary-button"
+              onClick={() => {
+                setAuthInitialized(false);
+                setAuthInitializationError("");
+                void initializeAuthentication();
+              }}
+              type="button"
+            >
+              Retry session check
+            </button>
+          </section>
+        ) : page === "wifi" && dashboardAuthenticated ? (
           <RemoteWiFiConfiguration
             deviceConnected={deviceConnected}
             onConfigured={refreshBackendStatus}
-            sessionToken={dashboardSession}
             wifiStatus={deviceStatus?.wifi}
           />
-        ) : deviceNeedsLogin ? (
+        ) : !dashboardAuthenticated ? (
           <section className="card access-card" aria-labelledby="access-title">
             <div className="card-heading">
               <div>
@@ -473,7 +491,7 @@ function App() {
                 Remember me on this device
               </label>
               <p className="remember-token-warning">
-                Stores a temporary session in this browser, not the access code. Don’t use on a shared device.
+                Keeps the secure, HttpOnly session cookie for 30 days instead of 12 hours. Don’t use on a shared device.
               </p>
               <button className="primary-button" disabled={authBusy} type="submit">
                 {authBusy ? "Checking access…" : "Sign in"}
