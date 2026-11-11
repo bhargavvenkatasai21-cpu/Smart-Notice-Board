@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFiClientSecure.h>
+#include <stdio.h>
 #include <mbedtls/sha256.h>
 #include <sodium.h>
 #include <string.h>
@@ -14,6 +15,7 @@
 namespace
 {
     constexpr size_t kMaximumManifestBytes = 4096;
+    constexpr size_t kMaximumReleaseMetadataBytes = 8192;
     constexpr size_t kDownloadBufferBytes = 4096;
     constexpr uint64_t kMaximumFirmwareBytes = 1507328;
     constexpr unsigned long kRequestTimeoutMs = 60000;
@@ -45,6 +47,15 @@ namespace
             const char character = value[index];
             if (character >= '0' && character <= '9')
             {
+                if (
+                    !hasDigit &&
+                    character == '0' &&
+                    index + 1 < value.length() &&
+                    value[index + 1] >= '0' &&
+                    value[index + 1] <= '9')
+                {
+                    return false;
+                }
                 hasDigit = true;
                 const uint32_t digit = static_cast<uint32_t>(character - '0');
                 if (components[component] > (UINT32_MAX - digit) / 10)
@@ -138,9 +149,14 @@ namespace
         return true;
     }
 
-    bool fetchManifest(String &manifest)
+    bool fetchText(
+        const char *url,
+        size_t maximumBytes,
+        String &responseBody,
+        const char *description,
+        const char *acceptHeader)
     {
-        Serial.println("[OTA] Preparing secure manifest connection...");
+        Serial.printf("[OTA] Preparing secure %s connection...\n", description);
 
         WiFiClientSecure client;
         client.setCACert(kTrustedCaCertificates);
@@ -150,67 +166,198 @@ namespace
         http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
         http.setRedirectLimit(kMaximumHttpRedirects);
 
-        Serial.println("[OTA] Opening manifest URL...");
+        Serial.printf("[OTA] Opening URL: %s\n", url);
 
-        if (!http.begin(client, BOARD_OTA_MANIFEST_URL))
+        if (!http.begin(client, url))
         {
-            Serial.println("[OTA] ERROR: HTTP begin failed.");
+            Serial.printf("[OTA] ERROR: Could not start %s HTTPS request.\n", description);
             return false;
         }
 
-        Serial.println("[OTA] Sending manifest GET request...");
+        if (acceptHeader != nullptr)
+        {
+            http.addHeader("Accept", acceptHeader);
+        }
+        http.addHeader("User-Agent", "SmartNoticeBoard-ESP32");
+        Serial.printf("[OTA] Sending %s HTTPS GET request...\n", description);
 
         const int statusCode = http.GET();
 
-        Serial.printf("[OTA] HTTP status: %d\n", statusCode);
+        Serial.printf("[OTA] %s HTTP status: %d\n", description, statusCode);
+        const String finalUrl = http.getLocation();
+        if (!finalUrl.isEmpty())
+        {
+            Serial.printf("[OTA] Final response URL: %s\n", finalUrl.c_str());
+        }
 
         if (statusCode != HTTP_CODE_OK)
         {
-            Serial.println("[OTA] ERROR: Manifest request failed.");
+            Serial.printf(
+                "[OTA] ERROR: %s request failed: %s\n",
+                description,
+                HTTPClient::errorToString(statusCode).c_str());
             http.end();
             return false;
         }
 
         const int contentLength = http.getSize();
-
-        Serial.printf("[OTA] Manifest size: %d bytes\n", contentLength);
+        Serial.printf("[OTA] %s Content-Length: %d bytes\n", description, contentLength);
 
         if (
-            contentLength <= 0 ||
-            static_cast<size_t>(contentLength) > kMaximumManifestBytes)
+            contentLength == 0 ||
+            (contentLength > 0 &&
+             static_cast<size_t>(contentLength) > maximumBytes))
         {
-            Serial.println("[OTA] ERROR: Invalid manifest size.");
+            Serial.printf("[OTA] ERROR: Invalid %s response size.\n", description);
             http.end();
             return false;
         }
 
-        Serial.println("[OTA] Reading manifest...");
-
-        manifest = http.getString();
-
-        Serial.printf("[OTA] Manifest received: %u bytes\n",
-                      static_cast<unsigned int>(manifest.length()));
+        responseBody = http.getString();
+        Serial.printf(
+            "[OTA] %s bytes received: %u\n",
+            description,
+            static_cast<unsigned int>(responseBody.length()));
 
         http.end();
 
-        return !manifest.isEmpty() &&
-               manifest.length() <= kMaximumManifestBytes;
+        if (
+            responseBody.isEmpty() ||
+            responseBody.length() > maximumBytes ||
+            (contentLength > 0 &&
+             responseBody.length() != static_cast<size_t>(contentLength)))
+        {
+            Serial.printf(
+                "[OTA] ERROR: %s response was empty, truncated, or oversized.\n",
+                description);
+            return false;
+        }
+        return true;
+    }
+
+    bool fetchManifest(
+        String &manifest,
+        String &releaseTag,
+        String &releaseVersion)
+    {
+        String releaseMetadata;
+        if (!fetchText(
+                BOARD_OTA_LATEST_RELEASE_API_URL,
+                kMaximumReleaseMetadataBytes,
+                releaseMetadata,
+                "GitHub latest stable release metadata",
+                "application/vnd.github+json"))
+        {
+            return false;
+        }
+
+        JsonDocument releaseDocument;
+        if (deserializeJson(releaseDocument, releaseMetadata))
+        {
+            Serial.println("[OTA] ERROR: GitHub release metadata is not valid JSON.");
+            return false;
+        }
+
+        if (
+            !releaseDocument["tag_name"].is<const char *>() ||
+            !releaseDocument["draft"].is<bool>() ||
+            !releaseDocument["prerelease"].is<bool>() ||
+            releaseDocument["draft"].as<bool>() ||
+            releaseDocument["prerelease"].as<bool>() ||
+            !releaseDocument["assets"].is<JsonArray>())
+        {
+            Serial.println("[OTA] ERROR: GitHub did not return a published stable release.");
+            return false;
+        }
+
+        releaseTag = releaseDocument["tag_name"].as<String>();
+        if (
+            releaseTag.length() < 2 ||
+            (releaseTag[0] != 'v' && releaseTag[0] != 'V'))
+        {
+            Serial.println("[OTA] ERROR: Stable release tag has an invalid format.");
+            return false;
+        }
+        releaseVersion = releaseTag.substring(1);
+        SemanticVersion parsedReleaseVersion;
+        if (!parseVersion(releaseVersion, parsedReleaseVersion))
+        {
+            Serial.println("[OTA] ERROR: Stable release tag is not semantic major.minor.patch.");
+            return false;
+        }
+
+        const String versionedManifestName =
+            "manifest-" + releaseVersion + ".json";
+        String versionedManifestUrl;
+        String fallbackManifestUrl;
+        const String assetPrefix =
+            String(BOARD_OTA_RELEASE_ASSET_PREFIX) + releaseTag + "/";
+        for (JsonObjectConst asset :
+             releaseDocument["assets"].as<JsonArrayConst>())
+        {
+            if (
+                !asset["name"].is<const char *>() ||
+                !asset["browser_download_url"].is<const char *>())
+            {
+                continue;
+            }
+            const String name = asset["name"].as<String>();
+            const String url = asset["browser_download_url"].as<String>();
+            if (url != assetPrefix + name)
+            {
+                continue;
+            }
+            if (name == versionedManifestName)
+            {
+                versionedManifestUrl = url;
+            }
+            else if (name == "manifest.json")
+            {
+                fallbackManifestUrl = url;
+            }
+        }
+
+        const String manifestUrl = !versionedManifestUrl.isEmpty()
+            ? versionedManifestUrl
+            : fallbackManifestUrl;
+        if (manifestUrl.isEmpty())
+        {
+            Serial.println(
+                "[OTA] ERROR: Stable release has no supported signed manifest asset.");
+            return false;
+        }
+
+        Serial.printf(
+            "[OTA] Latest stable release: %s; manifest asset: %s\n",
+            releaseTag.c_str(),
+            manifestUrl.c_str());
+        return fetchText(
+            manifestUrl.c_str(),
+            kMaximumManifestBytes,
+            manifest,
+            "signed firmware manifest",
+            "application/json");
     }
 
     bool validateManifest(
         JsonDocument &document,
         const String &currentVersion,
+        const String &releaseTag,
+        bool allowReinstall,
+        bool forCheck,
         SemanticVersion &newVersion,
         size_t &firmwareSize,
         String &firmwareUrl,
         unsigned char *expectedHash,
         String &manifestVersion,
+        bool &sameVersion,
         String &failureMessage)
     {
         if (
             document["schemaVersion"] != 1 ||
             !document["version"].is<const char *>() ||
             !document["firmwareUrl"].is<const char *>() ||
+            !document["size"].is<uint32_t>() ||
             !document["sha256"].is<const char *>() ||
             !document["signature"].is<const char *>())
         {
@@ -222,30 +369,38 @@ namespace
         firmwareUrl = document["firmwareUrl"].as<String>();
         const String hashHex = document["sha256"].as<String>();
         const String signatureHex = document["signature"].as<String>();
-        const uint64_t declaredSize = document["size"] | 0ULL;
+        const uint64_t declaredSize = document["size"].as<uint32_t>();
+        SemanticVersion releaseVersion;
 
         SemanticVersion current;
         if (
             !parseVersion(currentVersion, current) ||
-            !parseVersion(manifestVersion, newVersion))
+            !parseVersion(manifestVersion, newVersion) ||
+            !parseVersion(releaseTag.substring(1), releaseVersion) ||
+            compareVersions(newVersion, releaseVersion) != 0)
         {
-            failureMessage = "The current or published firmware version is invalid.";
+            failureMessage = "The current firmware, release tag, or manifest version is invalid.";
             return false;
         }
 
+        const size_t availableSpace = ESP.getFreeSketchSpace();
+        Serial.printf(
+            "[OTA] OTA slot capacity available: %u bytes\n",
+            static_cast<unsigned int>(availableSpace));
         if (
             declaredSize == 0 ||
             declaredSize > kMaximumFirmwareBytes ||
-            declaredSize > static_cast<uint64_t>(ESP.getFreeSketchSpace()) ||
+            declaredSize > static_cast<uint64_t>(availableSpace) ||
             declaredSize > SIZE_MAX)
         {
-            failureMessage = "The release firmware size is invalid or exceeds the OTA slot.";
+            failureMessage =
+                "The release firmware size is invalid or exceeds the OTA slot capacity.";
             return false;
         }
 
         const String expectedUrl =
             String(BOARD_OTA_RELEASE_ASSET_PREFIX) +
-            "V" + manifestVersion + "/firmware.bin";
+            releaseTag + "/firmware.bin";
         unsigned char signature[crypto_sign_BYTES];
         if (
             firmwareUrl != expectedUrl ||
@@ -290,14 +445,16 @@ namespace
         }
 
         const int versionComparison = compareVersions(newVersion, current);
-        if (versionComparison == 0)
-        {
-            failureMessage = "The ESP32 already has the latest firmware.";
-            return false;
-        }
         if (versionComparison < 0)
         {
             failureMessage = "Firmware downgrade was rejected.";
+            return false;
+        }
+        sameVersion = versionComparison == 0;
+        if (!forCheck && sameVersion && !allowReinstall)
+        {
+            failureMessage =
+                "Same-version reinstall requires explicit confirmation.";
             return false;
         }
 
@@ -327,7 +484,9 @@ namespace
 
         if (!http.begin(client, firmwareUrl))
         {
-            Serial.println("[OTA] ERROR: Firmware HTTP begin failed.");
+            Serial.printf(
+                "[OTA] ERROR: Could not start HTTPS download for %s\n",
+                firmwareUrl.c_str());
             failureMessage = "Could not start the firmware download.";
             return false;
         }
@@ -335,6 +494,12 @@ namespace
         Serial.println("[OTA] Sending firmware HTTPS GET request...");
         const int statusCode = http.GET();
         Serial.printf("[OTA] Firmware HTTP status: %d\n", statusCode);
+        const String finalUrl = http.getLocation();
+        if (!finalUrl.isEmpty())
+        {
+            Serial.printf("[OTA] Firmware final response URL: %s\n",
+                          finalUrl.c_str());
+        }
         if (statusCode != HTTP_CODE_OK)
         {
             Serial.printf("[OTA] Firmware HTTP error: %s\n",
@@ -349,6 +514,13 @@ namespace
                       contentLength);
         Serial.printf("[OTA] Signed manifest size: %u bytes\n",
                       static_cast<unsigned int>(firmwareSize));
+        if (contentLength == 0)
+        {
+            Serial.println("[OTA] ERROR: Firmware response has an empty body.");
+            http.end();
+            failureMessage = "The firmware server returned an empty image.";
+            return false;
+        }
 
         // A positive Content-Length must match the signed manifest. A value of
         // -1 means the server did not provide a length; the signed size and
@@ -460,6 +632,24 @@ namespace
         Serial.printf("[OTA] SHA-256 calculation: %s\n",
                       hashSucceeded ? "SUCCESS" : "FAILED");
 
+        char actualHashHex[65] = {};
+        char expectedHashHex[65] = {};
+        for (size_t index = 0; index < sizeof(actualHash); ++index)
+        {
+            snprintf(
+                actualHashHex + index * 2,
+                sizeof(actualHashHex) - index * 2,
+                "%02x",
+                actualHash[index]);
+            snprintf(
+                expectedHashHex + index * 2,
+                sizeof(expectedHashHex) - index * 2,
+                "%02x",
+                expectedHash[index]);
+        }
+        Serial.printf("[OTA] Expected SHA-256: %s\n", expectedHashHex);
+        Serial.printf("[OTA] Actual SHA-256:   %s\n", actualHashHex);
+
         const bool hashMatches =
             hashSucceeded &&
             sodium_memcmp(actualHash, expectedHash, sizeof(actualHash)) == 0;
@@ -468,15 +658,18 @@ namespace
 
         http.end();
 
-        if (!downloadSucceeded ||
-            received != firmwareSize ||
-            !hashSucceeded ||
-            !hashMatches)
+        if (!downloadSucceeded || received != firmwareSize)
         {
             Update.abort();
-            Serial.println("[OTA] ERROR: Firmware size or SHA-256 verification failed.");
-            failureMessage =
-                "The downloaded firmware failed size or SHA-256 verification.";
+            Serial.println("[OTA] ERROR: Firmware transfer was incomplete.");
+            failureMessage = "The firmware download was interrupted or incomplete.";
+            return false;
+        }
+        if (!hashSucceeded || !hashMatches)
+        {
+            Update.abort();
+            Serial.println("[OTA] ERROR: Downloaded firmware SHA-256 did not match.");
+            failureMessage = "The downloaded firmware SHA-256 did not match the signed manifest.";
             return false;
         }
 
@@ -496,12 +689,113 @@ namespace
         ESP.restart();
         return true;
     }
+
+    bool loadLatestManifest(
+        const String &currentVersion,
+        bool allowReinstall,
+        bool forCheck,
+        String &firmwareUrl,
+        size_t &firmwareSize,
+        unsigned char *expectedHash,
+        String &manifestVersion,
+        bool &sameVersion,
+        String &failureMessage)
+    {
+        String manifest;
+        String releaseTag;
+        String releaseVersion;
+        if (!fetchManifest(manifest, releaseTag, releaseVersion))
+        {
+            failureMessage =
+                "Could not securely download the latest stable GitHub release manifest.";
+            return false;
+        }
+
+        JsonDocument document;
+        if (deserializeJson(document, manifest))
+        {
+            failureMessage = "The GitHub release manifest is not valid JSON.";
+            return false;
+        }
+
+        SemanticVersion releaseTagVersion;
+        if (!parseVersion(releaseVersion, releaseTagVersion))
+        {
+            failureMessage = "The latest stable release tag is invalid.";
+            return false;
+        }
+
+        SemanticVersion newVersion;
+        return validateManifest(
+            document,
+            currentVersion,
+            releaseTag,
+            allowReinstall,
+            forCheck,
+            newVersion,
+            firmwareSize,
+            firmwareUrl,
+            expectedHash,
+            manifestVersion,
+            sameVersion,
+            failureMessage);
+    }
 }
 
 namespace firmware_update
 {
+    bool checkForUpdate(
+        const char *currentVersion,
+        StatusCallback reportStatus,
+        String &availableVersion,
+        String &failureMessage)
+    {
+        if (reportStatus == nullptr)
+        {
+            failureMessage = "Firmware update status reporting is unavailable.";
+            return false;
+        }
+        if (
+            strlen(BOARD_OTA_ED25519_PUBLIC_KEY_HEX) !=
+            crypto_sign_PUBLICKEYBYTES * 2)
+        {
+            failureMessage = "OTA is disabled: configure the Ed25519 public key.";
+            return false;
+        }
+
+        reportStatus("checking", "");
+        String firmwareUrl;
+        size_t firmwareSize = 0;
+        unsigned char expectedHash[32] = {};
+        bool sameVersion = false;
+        if (!loadLatestManifest(
+                String(currentVersion),
+                false,
+                true,
+                firmwareUrl,
+                firmwareSize,
+                expectedHash,
+                availableVersion,
+                sameVersion,
+                failureMessage))
+        {
+            return false;
+        }
+
+        if (sameVersion)
+        {
+            reportStatus("up_to_date", availableVersion);
+        }
+        else
+        {
+            reportStatus("available", availableVersion);
+        }
+        return true;
+    }
+
     bool performUpdate(
         const char *currentVersion,
+        bool allowReinstall,
         StatusCallback reportStatus,
         String &updatedVersion,
         String &failureMessage)
@@ -521,38 +815,28 @@ namespace firmware_update
         }
 
         reportStatus("checking", "");
-        String manifest;
-        if (!fetchManifest(manifest))
-        {
-            failureMessage =
-                "Could not securely download the GitHub release manifest.";
-            return false;
-        }
-
-        JsonDocument document;
-        if (deserializeJson(document, manifest))
-        {
-            failureMessage = "The GitHub release manifest is not valid JSON.";
-            return false;
-        }
-
         String firmwareUrl;
         size_t firmwareSize = 0;
-        unsigned char expectedHash[32];
-        SemanticVersion newVersion;
-        if (!validateManifest(
-                document,
+        unsigned char expectedHash[32] = {};
+        bool sameVersion = false;
+        if (!loadLatestManifest(
                 String(currentVersion),
-                newVersion,
-                firmwareSize,
+                allowReinstall,
+                false,
                 firmwareUrl,
+                firmwareSize,
                 expectedHash,
                 updatedVersion,
+                sameVersion,
                 failureMessage))
         {
-            if (failureMessage == "The ESP32 already has the latest firmware.")
+            if (
+                sameVersion &&
+                failureMessage ==
+                    "Same-version reinstall requires explicit confirmation.")
             {
-                reportStatus("up_to_date", String(currentVersion));
+                reportStatus("up_to_date", updatedVersion);
+                return true;
             }
             return false;
         }

@@ -1,10 +1,18 @@
 const { before, after, test } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const WebSocket = require("ws");
 
+const sessionDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "smart-notice-backend-test-")
+);
 process.env.PORT = "0";
 process.env.ESP32_DEVICE_TOKEN = "test-device-token";
 process.env.DASHBOARD_ACCESS_CODE = "test-access-code";
+process.env.DASHBOARD_SESSION_STORE_PATH =
+    path.join(sessionDirectory, "sessions.json");
 process.env.DASHBOARD_ORIGIN =
     "http://localhost:5173,https://dashboard.example.test";
 process.env.NOTICE_ACK_TIMEOUT_MS = "300";
@@ -15,13 +23,13 @@ process.env.FIRMWARE_UPDATE_TIMEOUT_MS = "500";
 const { server } = require("./server");
 const DEVICE_TOKEN = process.env.ESP32_DEVICE_TOKEN;
 const DASHBOARD_ACCESS_CODE = process.env.DASHBOARD_ACCESS_CODE;
-let DASHBOARD_TOKEN = "";
+let DASHBOARD_COOKIE = "";
 let baseUrl;
 let deviceSocket;
 
 function dashboardHeaders(extra = {}) {
     return {
-        Authorization: `Bearer ${DASHBOARD_TOKEN}`,
+        Cookie: DASHBOARD_COOKIE,
         "Content-Type": "application/json",
         ...extra
     };
@@ -63,7 +71,8 @@ before(async () => {
     });
     const session = await response.json();
     assert.equal(response.status, 200);
-    DASHBOARD_TOKEN = session.sessionToken;
+    DASHBOARD_COOKIE = response.headers.get("set-cookie").split(";")[0];
+    assert.equal(session.success, true);
 });
 
 after(async () => {
@@ -72,6 +81,7 @@ after(async () => {
         await new Promise((resolve) => deviceSocket.once("close", resolve));
     }
     await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(sessionDirectory, { recursive: true, force: true });
 });
 
 test("health endpoint is public and reports WebSocket connectivity", async () => {
@@ -121,6 +131,7 @@ test("dashboard access code creates a session and rejects incorrect or empty cod
     assert.equal(typeof session.sessionToken, "string");
     assert.equal(session.sessionToken.length, 64);
     assert.equal(typeof session.expiresAt, "string");
+    assert.match(loginResponse.headers.get("set-cookie"), /Max-Age=2592000/);
 
     const statusResponse = await fetch(`${baseUrl}/api/device/status`, {
         headers: { Authorization: `Bearer ${session.sessionToken}` }
@@ -128,12 +139,67 @@ test("dashboard access code creates a session and rejects incorrect or empty cod
     assert.equal(statusResponse.status, 200);
 });
 
+test("browser sessions use secure expiring cookies and survive refresh until logout", async () => {
+    const origin = "https://dashboard.example.test";
+    const loginResponse = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Origin: origin,
+            "X-Forwarded-Proto": "https"
+        },
+        body: JSON.stringify({ accessCode: DASHBOARD_ACCESS_CODE })
+    });
+    const session = await loginResponse.json();
+    const cookieHeader = loginResponse.headers.get("set-cookie");
+    const cookie = cookieHeader.split(";")[0];
+
+    assert.equal(loginResponse.status, 200);
+    assert.equal(session.success, true);
+    assert.equal("sessionToken" in session, false);
+    assert.match(cookieHeader, /HttpOnly/);
+    assert.match(cookieHeader, /Secure/);
+    assert.match(cookieHeader, /SameSite=None/);
+    assert.match(cookieHeader, /Max-Age=43200/);
+
+    const restored = await fetch(`${baseUrl}/api/auth/session`, {
+        headers: {
+            Cookie: cookie,
+            Origin: origin,
+            "X-Forwarded-Proto": "https"
+        }
+    });
+    assert.equal(restored.status, 200);
+    assert.equal((await restored.json()).expiresAt, session.expiresAt);
+
+    const logout = await fetch(`${baseUrl}/api/auth/logout`, {
+        method: "POST",
+        headers: {
+            Cookie: cookie,
+            Origin: origin,
+            "X-Forwarded-Proto": "https"
+        }
+    });
+    assert.equal(logout.status, 200);
+    assert.match(logout.headers.get("set-cookie"), /Max-Age=0/);
+
+    const afterLogout = await fetch(`${baseUrl}/api/auth/session`, {
+        headers: {
+            Cookie: cookie,
+            Origin: origin,
+            "X-Forwarded-Proto": "https"
+        }
+    });
+    assert.equal(afterLogout.status, 401);
+});
+
 test("device status and notice routes require dashboard authentication", async () => {
     const response = await fetch(`${baseUrl}/api/device/status`);
     assert.equal(response.status, 401);
     assert.deepEqual(await response.json(), {
         success: false,
-        message: "Dashboard session is invalid or expired."
+        code: "session_missing",
+        message: "Dashboard sign-in is required."
     });
 
     const invalidToken = await fetch(`${baseUrl}/api/notices`, {
@@ -622,6 +688,56 @@ test("firmware update is authorized, tracked, and verified after device reconnec
 
     updatedSocket.close();
     await new Promise((resolve) => updatedSocket.once("close", resolve));
+    deviceSocket = null;
+});
+
+test("firmware release check is separate and never commands installation", async () => {
+    const socket = await connectDevice();
+    const commandReceived = new Promise((resolve, reject) => {
+        const timeout = setTimeout(
+            () => reject(new Error("Firmware release check was not sent")),
+            1000
+        );
+        socket.once("message", (raw) => {
+            clearTimeout(timeout);
+            resolve(JSON.parse(raw.toString()));
+        });
+    });
+
+    const response = await fetch(`${baseUrl}/api/device/firmware-check`, {
+        method: "POST",
+        headers: dashboardHeaders()
+    });
+    const started = await response.json();
+    const command = await commandReceived;
+    assert.equal(response.status, 202);
+    assert.equal(command.type, "FIRMWARE_CHECK");
+    assert.equal(command.requestId, started.requestId);
+    assert.equal("allowReinstall" in command, false);
+
+    socket.send(JSON.stringify({
+        type: "FIRMWARE_UPDATE_STATUS",
+        requestId: command.requestId,
+        state: "checking"
+    }));
+    socket.send(JSON.stringify({
+        type: "FIRMWARE_UPDATE_STATUS",
+        requestId: command.requestId,
+        state: "available",
+        version: "1.0.4"
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const statusResponse = await fetch(
+        `${baseUrl}/api/device/firmware-update/${command.requestId}`,
+        { headers: dashboardHeaders() }
+    );
+    const status = await statusResponse.json();
+    assert.equal(status.operation.state, "available");
+    assert.equal(status.operation.version, "1.0.4");
+
+    socket.close();
+    await new Promise((resolve) => socket.once("close", resolve));
     deviceSocket = null;
 });
 

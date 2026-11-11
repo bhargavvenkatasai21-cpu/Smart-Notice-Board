@@ -13,7 +13,7 @@
 - [ ] Confirm the ESP32 model has 4 MiB flash and the custom partition layout.
 - [ ] Set a unique, non-default `BOARD_AP_PASSWORD` (8–63 bytes) in the ignored `include/secrets.h`; verify PlatformIO blocks upload without it.
 - [ ] Confirm the device token matches the backend environment.
-- [ ] If testing OTA, configure the owner's public key and verify the matching private key remains offline and outside the repository. **OTA is currently disabled; no OTA test was performed.**
+- [ ] Before OTA testing, verify the configured public trust key matches the owner's offline private signing key. **OTA checks are enabled in source; no physical OTA test was performed.**
 - [ ] Keep USB serial recovery available. Do not erase NVS unless prepared to re-enter router credentials.
 
 ## Wi-Fi and recovery
@@ -39,7 +39,7 @@
 
 - [~] Confirm the device rejects invalid/untrusted TLS and connects to the backend using verified WSS after network-time synchronization. Successful secure WebSocket connection and device authentication were observed after the time-validation step. Invalid/untrusted TLS rejection was not tested, and explicit NTP synchronization confirmation was not recorded.
 - [ ] Publish a signed release only after checking version, asset URL, size, digest, and signature independently. No release was published.
-- [ ] Verify a valid update downloads, installs, reboots, and reports the expected version to the backend. OTA is disabled and was not tested.
+- [ ] Verify a valid stable-release check, download, install, reboot, reconnection, and reported version to the backend.
 - [ ] Test same-version, downgrade, invalid signature, modified image, mismatched size, TLS failure, and unavailable release. None may install. Not tested.
 - [ ] Verify the previous application remains recoverable after a failed or interrupted update; document the observed boot/rollback behavior. Not tested.
 
@@ -66,6 +66,26 @@
 3. Test router outage/recovery and blocked-NTP behavior.
 4. Test notice length boundaries and all scrolling timing/blank-frame behavior.
 5. Test invalid TLS rejection.
-6. Keep OTA tests pending until OTA is deliberately enabled and a properly signed test release is prepared.
+6. Prepare a properly signed stable test release and verify the firmware trust key before OTA testing.
+
+## Required physical verification after these code changes
+
+These are pending unless the earlier owner-reported observations above explicitly say otherwise:
+
+1. [ ] Normal boot; record reset reason, uptime, AP, HTTP server, LCD, and firmware version.
+2. [ ] Connect to `SmartNoticeBoard` and verify `192.168.4.1` and the local HTTP setup page.
+3. [ ] Connect to a valid router network; verify DHCP, TLS time synchronization, and WebSocket authentication.
+4. [ ] Enter a wrong Wi-Fi password; verify no reboot, AP/HTTP/LCD operation, and saved-credential preservation.
+5. [ ] Turn the router off; verify the ESP32 remains powered, AP/HTTP remain reachable, and reset reason/uptime do not change.
+6. [ ] Restore the router; verify saved-credential reconnection and WebSocket recovery without a reboot.
+7. [ ] Send a notice during normal connectivity and verify acknowledgement and the physical LCD.
+8. [ ] Verify 16×2 display behavior, scrolling, trailing blank frame, and restart position.
+9. [ ] Use **Forget saved Wi-Fi** explicitly; verify credentials are erased while the setup AP remains available.
+10. [ ] Reboot and verify saved credentials reconnect when they have not been explicitly forgotten.
+11. [ ] Check the latest stable signed release; verify this check alone does not download or install firmware.
+12. [ ] Install a newer signed release; verify reboot, reconnect, and backend-reported version.
+13. [ ] Explicitly reinstall the same version; verify confirmation and successful recovery.
+14. [ ] Offer an older release; verify downgrade is rejected and the running firmware remains unchanged.
+15. [ ] Reboot once more and confirm the installed version and notice/LCD behavior.
 
 **Important:** Results above are based on owner-reported physical observations and the Serial Monitor excerpts supplied. They do not imply that untested negative paths, partition migration, or OTA behavior have been validated.

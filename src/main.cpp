@@ -28,7 +28,10 @@ namespace
 #endif
     constexpr char kApPassword[] = BOARD_AP_PASSWORD;
     constexpr char kPreferencesNamespace[] = "wifi";
-    constexpr char kFirmwareVersion[] = "1.0.3";
+#ifndef BOARD_FIRMWARE_VERSION
+#define BOARD_FIRMWARE_VERSION "1.0.3"
+#endif
+    constexpr char kFirmwareVersion[] = BOARD_FIRMWARE_VERSION;
 
     constexpr char kBackendHost[] = "smart-notice-board-api.onrender.com";
     constexpr uint16_t kBackendPort = 443;
@@ -76,7 +79,10 @@ namespace
     bool reconnectBackoffActive = false;
     bool wifiForgetDisconnectPending = false;
     bool firmwareUpdateInProgress = false;
+    bool firmwareAllowReinstall = false;
     bool timeSyncRequested = false;
+    volatile bool accessPointStarted = false;
+    unsigned long lastAccessPointStartAttemptAt = 0;
     String connectionTargetSsid;
     String connectionError;
     volatile bool stationGotIpEvent = false;
@@ -127,6 +133,31 @@ namespace
                WiFi.status() == WL_CONNECTED &&
                !connectionTargetSsid.isEmpty() &&
                WiFi.SSID() == connectionTargetSsid;
+    }
+
+    const char *resetReasonName(esp_reset_reason_t reason)
+    {
+        switch (reason)
+        {
+        case ESP_RST_POWERON:
+            return "power-on";
+        case ESP_RST_EXT:
+            return "external reset";
+        case ESP_RST_SW:
+            return "software reset";
+        case ESP_RST_PANIC:
+            return "panic";
+        case ESP_RST_INT_WDT:
+            return "interrupt watchdog";
+        case ESP_RST_TASK_WDT:
+            return "task watchdog";
+        case ESP_RST_WDT:
+            return "watchdog";
+        case ESP_RST_BROWNOUT:
+            return "brownout";
+        default:
+            return "other";
+        }
     }
 
     // JHD161A is physically one row of 16 characters. Internally, its
@@ -391,21 +422,27 @@ namespace
         xQueueSend(firmwareUpdateStatusQueue, &event, portMAX_DELAY);
     }
 
-    void firmwareUpdateTask(void *)
+    void firmwareUpdateTask(void *argument)
     {
         Serial.println("[OTA] Firmware update worker started.");
+        const bool checkOnly = reinterpret_cast<uintptr_t>(argument) == 1;
         String updatedVersion;
         String failureMessage;
-        const bool updateStarted = firmware_update::performUpdate(
-            kFirmwareVersion,
-            reportFirmwareUpdateStatus,
-            updatedVersion,
-            failureMessage);
+        const bool operationSucceeded = checkOnly
+            ? firmware_update::checkForUpdate(
+                  kFirmwareVersion,
+                  reportFirmwareUpdateStatus,
+                  updatedVersion,
+                  failureMessage)
+            : firmware_update::performUpdate(
+                  kFirmwareVersion,
+                  firmwareAllowReinstall,
+                  reportFirmwareUpdateStatus,
+                  updatedVersion,
+                  failureMessage);
 
         if (
-            !updateStarted &&
-            failureMessage !=
-                "The ESP32 already has the latest firmware.")
+            !operationSucceeded)
         {
             FirmwareUpdateEvent event{};
             event.type = FirmwareUpdateEventType::Status;
@@ -436,12 +473,15 @@ namespace
             else
             {
                 firmwareUpdateInProgress = false;
+                firmwareAllowReinstall = false;
                 firmwareUpdateRequestId = "";
             }
         }
     }
 
-    void handleRemoteFirmwareUpdate(JsonDocument &document)
+    void handleRemoteFirmwareOperation(
+        JsonDocument &document,
+        bool checkOnly)
     {
         const char *requestId = document["requestId"];
         if (!validRequestId(requestId))
@@ -450,6 +490,17 @@ namespace
         }
 
         const String requestIdValue(requestId);
+        if (
+            !checkOnly &&
+            (!document["allowReinstall"].is<bool>()))
+        {
+            sendFirmwareUpdateStatus(
+                requestIdValue,
+                "failed",
+                "",
+                "Firmware installation requires an explicit reinstall choice.");
+            return;
+        }
         if (
             !webSocketAuthenticated ||
             firmwareUpdateInProgress ||
@@ -476,13 +527,17 @@ namespace
         }
 
         firmwareUpdateInProgress = true;
+        firmwareAllowReinstall =
+            !checkOnly && document["allowReinstall"].as<bool>();
         firmwareUpdateRequestId = requestIdValue;
-        Serial.println("[OTA] Starting firmware update worker.");
+        Serial.printf(
+            "[OTA] Starting %s worker.\n",
+            checkOnly ? "stable release check" : "firmware installation");
         const BaseType_t taskCreated = xTaskCreate(
             firmwareUpdateTask,
             "firmwareUpdate",
             16384,
-            nullptr,
+            checkOnly ? reinterpret_cast<void *>(1) : nullptr,
             1,
             nullptr);
         if (taskCreated != pdPASS)
@@ -493,6 +548,7 @@ namespace
                 "",
                 "Firmware update task could not be started.");
             firmwareUpdateInProgress = false;
+            firmwareAllowReinstall = false;
             firmwareUpdateRequestId = "";
         }
     }
@@ -996,7 +1052,11 @@ namespace
             }
             else if (strcmp(messageType, "FIRMWARE_UPDATE") == 0)
             {
-                handleRemoteFirmwareUpdate(document);
+                handleRemoteFirmwareOperation(document, false);
+            }
+            else if (strcmp(messageType, "FIRMWARE_CHECK") == 0)
+            {
+                handleRemoteFirmwareOperation(document, true);
             }
 
             break;
@@ -1273,10 +1333,13 @@ setInterval(checkStatus, 3000);
 
     void startAccessPoint()
     {
+        lastAccessPointStartAttemptAt = millis();
         const bool success = WiFi.softAP(kApName, kApPassword);
+        accessPointStarted = success;
         if (!success)
         {
-            Serial.println("ERROR: Failed to start setup access point");
+            Serial.println(
+                "ERROR: Failed to start setup AP; the HTTP server remains active and AP startup will be retried.");
             return;
         }
 
@@ -1319,12 +1382,23 @@ setInterval(checkStatus, 3000);
     {
         const unsigned long now = millis();
 
+        if (
+            !accessPointStarted &&
+            now - lastAccessPointStartAttemptAt >= 10000)
+        {
+            Serial.println("Retrying setup AP startup without rebooting.");
+            startAccessPoint();
+        }
+
         if (stationDisconnectedEvent)
         {
             stationDisconnectedEvent = false;
             Serial.printf(
-                "WiFi station disconnected (reason %u)\n",
-                stationDisconnectReason);
+                "WiFi station disconnected (reason %u); recovery AP %s at %s; uptime %lu ms\n",
+                stationDisconnectReason,
+                accessPointStarted ? "is running" : "is NOT running",
+                WiFi.softAPIP().toString().c_str(),
+                static_cast<unsigned long>(millis()));
         }
 
         if (stationGotIpEvent)
@@ -1487,7 +1561,9 @@ setInterval(checkStatus, 3000);
             }
             connectionError =
                 "WiFi connection timed out. Check the network name, password, and signal.";
-            Serial.println("WiFi connection attempt timed out");
+            Serial.printf(
+                "WiFi connection attempt timed out; next saved-network retry in %lu ms\n",
+                reconnectDelayMs);
             WiFi.setAutoReconnect(false);
             WiFi.disconnect(false, false);
             connectionSawDisconnect = true;
@@ -1536,9 +1612,11 @@ void setup()
 
     Serial.println();
     Serial.println("Starting Smart Notice Board...");
+    const esp_reset_reason_t resetReason = esp_reset_reason();
     Serial.printf(
-        "Reset reason code: %d\n",
-        static_cast<int>(esp_reset_reason()));
+        "Boot/reset reason: %s (%d). A station Wi-Fi disconnect does not reboot the ESP32.\n",
+        resetReasonName(resetReason),
+        static_cast<int>(resetReason));
     firmwareUpdateStatusQueue = xQueueCreate(8, sizeof(FirmwareUpdateEvent));
     if (firmwareUpdateStatusQueue == nullptr)
     {
@@ -1559,7 +1637,10 @@ void setup()
     lcd.clear();
     writeLcd16("Starting Board");
 
-    WiFi.mode(WIFI_AP_STA);
+    if (!WiFi.mode(WIFI_AP_STA))
+    {
+        Serial.println("ERROR: Could not enable AP+STA Wi-Fi mode.");
+    }
     WiFi.setAutoReconnect(true);
     WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info)
                  {
@@ -1568,6 +1649,12 @@ void setup()
         } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
             stationDisconnectReason = info.wifi_sta_disconnected.reason;
             stationDisconnectedEvent = true;
+        } else if (event == ARDUINO_EVENT_WIFI_AP_START) {
+            accessPointStarted = true;
+            Serial.println("Recovery access point started.");
+        } else if (event == ARDUINO_EVENT_WIFI_AP_STOP) {
+            accessPointStarted = false;
+            Serial.println("WARNING: Recovery access point stopped.");
         } });
 
     startAccessPoint();

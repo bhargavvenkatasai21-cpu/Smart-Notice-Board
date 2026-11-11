@@ -8,6 +8,7 @@
 **/dist/
 **/build/
 **/coverage/
+backend/data/
 
 # Environment variables and secrets
 .env

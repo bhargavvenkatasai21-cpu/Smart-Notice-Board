@@ -83,6 +83,7 @@ class SignOtaReleaseTests(unittest.TestCase):
                 "1.2.3",
                 self.private_key,
                 self.output,
+                "v1.2.3",
             )
 
         manifest = json.loads(output.read_text(encoding="utf-8"))
@@ -105,6 +106,7 @@ class SignOtaReleaseTests(unittest.TestCase):
                     "1.2.3",
                     self.private_key,
                     self.output,
+                    "v1.2.3",
                 )
         run.assert_not_called()
         self.assertFalse(self.output.exists())
@@ -130,6 +132,7 @@ class SignOtaReleaseTests(unittest.TestCase):
                 "1.2.3",
                 self.private_key,
                 self.output,
+                "v1.2.3",
             )
         self.assertEqual(json.loads(output.read_text())["size"], 1_507_328)
 
@@ -141,6 +144,7 @@ class SignOtaReleaseTests(unittest.TestCase):
                     "v1.2.3",
                     self.private_key,
                     self.output,
+                    "v1.2.3",
                 )
         run.assert_not_called()
 
@@ -153,6 +157,7 @@ class SignOtaReleaseTests(unittest.TestCase):
                 "1.2.3",
                 repository_key,
                 self.output,
+                "v1.2.3",
             )
 
     def test_output_outside_release_artifacts_is_rejected(self):
@@ -162,6 +167,7 @@ class SignOtaReleaseTests(unittest.TestCase):
                 "1.2.3",
                 self.private_key,
                 self.root / "manifest.json",
+                "v1.2.3",
             )
 
     def test_existing_output_is_never_overwritten(self):
@@ -173,8 +179,21 @@ class SignOtaReleaseTests(unittest.TestCase):
                 "1.2.3",
                 self.private_key,
                 self.output,
+                "v1.2.3",
             )
         self.assertEqual(self.output.read_bytes(), original)
+
+    def test_release_tag_must_match_manifest_version_exactly(self):
+        with patch("tools.sign_ota_release.subprocess.run") as run:
+            with self.assertRaisesRegex(ValueError, "exact v/V-prefixed"):
+                sign_ota_release.sign_release(
+                    self.firmware,
+                    "1.2.3",
+                    self.private_key,
+                    self.output,
+                    "V1.2.4",
+                )
+        run.assert_not_called()
 
     def test_rfc8032_ed25519_signature_accepts_valid_and_rejects_invalid(self):
         node = shutil.which("node")

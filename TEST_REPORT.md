@@ -1,6 +1,7 @@
 # Smart Notice Board Test Report
 
-**Hardware test date:** 2026-11-08  
+**Hardware test date:** 2026-11-08 (owner-reported historical results)
+**Software validation date:** 2026-11-11
 **Firmware target:** PlatformIO `esp32dev`, ESP32 Arduino framework  
 **Scope:** Dashboard, backend, ESP32 firmware, Wi-Fi provisioning and recovery, LCD notice display, security, and signed OTA implementation.
 
@@ -20,7 +21,7 @@ The following physical-device results are based on the project owner's tests and
 | 8 | Dashboard status | Dashboard reported Backend Online, ESP32 Online, and WebSocket Online. | PASS (owner-reported) |
 | 9 | Short notice delivery | A notice sent from the dashboard was received by the ESP32 and displayed on the LCD. | PASS |
 | 10 | LCD scrolling/display | LCD displayed the received notice. Serial Monitor showed `LCD notice display started at character 1`. | PASS (owner-reported) |
-| 11 | Automatic reconnect after network interruption | ESP32 reconnected to Wi-Fi, re-established the Render WebSocket, and authenticated. | PASS |
+| 11 | Network recovery | Network changes/reconnections were observed; an isolated router-off automatic recovery test and timing were not recorded. | PARTIAL |
 | 12 | Remote Wi-Fi configuration | New Wi-Fi credentials were submitted from the dashboard; ESP32 connected to the new network. | PASS |
 | 13 | Notice after remote Wi-Fi change | A new dashboard notice appeared correctly on the physical LCD after the network change. | PASS |
 | 14 | Forget saved Wi-Fi | Dashboard reported: `Saved Wi-Fi credentials were deleted. The setup access point remains available.` | PASS (owner-reported) |
@@ -30,31 +31,41 @@ The following physical-device results are based on the project owner's tests and
 | 18 | Network change through local setup | ESP32 changed networks, received `10.178.221.82`, and reconnected to Render and authenticated. | PASS |
 | 19 | Notice after local network change | Serial Monitor showed a new notice received and LCD display processing started. | PASS (owner-reported) |
 | 20 | Power-cycle recovery | After power was switched off and on, ESP32 automatically reconnected without manually entering Wi-Fi credentials. | PASS (owner-reported) |
-| 21 | Signed OTA update | OTA remains disabled because the Ed25519 public key has not been configured. No OTA release or installation was performed. | NOT TESTED / DISABLED |
+| 21 | Signed OTA update | No physical release check, download, installation, or reboot test was performed. | NOT TESTED |
 
 ## 2. Automated checks
 
-The following automated results were recorded in the earlier software audit. They are retained as reported results and were not independently rerun for this update.
+The following software checks were run for the current changes on 2026-11-10.
 
 | Check | Recorded result | Notes |
 |---|---|---|
-| PlatformIO firmware build | PASS | Firmware compiled successfully in the earlier audit. |
-| Dashboard production build | PASS | Earlier audit reported `npm run build` passed. |
-| Dashboard lint | PASS | Earlier audit reported no lint errors or warnings. |
-| Dashboard tests | PASS | Earlier audit reported 67 tests passed across 5 files. |
-| Backend integration tests | PASS | Earlier audit reported 18 tests passed, using a simulated WebSocket device. |
-| OTA signer and AP-password tests | PASS | Earlier audit reported 14 Python tests passed. |
-| TLS certificate validation | PASS | Earlier audit reported successful verified TLS handshakes to Render, GitHub, and GitHub release-assets hosts. |
-| Partition layout validation | PASS | Earlier audit reported that the custom partition table fits 4 MiB flash. |
-| Git secret/artifact audit | PASS | Earlier audit reported no real `.env`, `secrets.h`, signing private key, release artifact, or firmware build output tracked. |
-| Dependency audit | 6 MODERATE ADVISORIES | Earlier audit reported 2 backend and 4 dashboard moderate advisories; no high/critical advisories. |
+| Backend integration tests | PASS — 22 tests | Includes session persistence/expiry, cookie lifecycle and logout, authenticated device operations, WebSocket notice acknowledgment, and separate OTA check/install operations. |
+| Dashboard tests | PASS — 68 tests across 5 files | Includes cookie-session restoration, auth initialization, explicit OTA check/install/reinstall controls, and service requests with credentials. |
+| Dashboard lint | PASS | `npm run lint` |
+| Dashboard production build | PASS | `npm run build` |
+| OTA signer and helper tests | PASS — 15 tests | |
+| PlatformIO firmware build | PASS | Compiled `esp32dev` with `BOARD_FIRMWARE_VERSION=1.0.3`, `1.0.10`, and `1.0.4`; the latest build used 85.3% of the configured application partition and 15.7% of RAM. No board was flashed. |
+| Firmware version metadata validation | PASS | Numeric versions compiled without firmware source edits; an invalid prerelease version was rejected. |
+| Firmware OTA/network runtime | NOT RUN | Requires device/release/network integration; compilation does not validate physical behavior. |
+| Published stable release integrity | PASS | Queried GitHub latest: `V1.0.3` is stable, assets are `firmware.bin` and `manifest-1.0.3.json`; downloaded image size (1,297,616 bytes), SHA-256, and Ed25519 signature all match the manifest. |
+| TLS certificate validation | Not rerun on device | Public release HTTPS transfer succeeded from this host; this does not establish ESP32 TLS behavior. |
+| Dependency audit | Not rerun | Earlier audit reported six moderate advisories; no dependency changes were made. |
 
 ## 3. OTA status and limitations
 
-- OTA functionality is implemented in the firmware but remains disabled until the owner configures the Ed25519 public key in `include/ota_config.h`.
+- The prior firmware was pinned to one release manifest, and release tags use
+  mixed `v`/`V` casing. Discovery now uses the GitHub latest-stable API and
+  selects an asset from its actual release metadata; the signer requires the
+  exact release tag. The historical device size/hash failure cannot be
+  attributed conclusively without the device's serial log and exact uploaded
+  image/manifest pair. The current published `V1.0.3` image and manifest have
+  been independently checked and are internally consistent.
+- OTA is enabled in the source with a configured Ed25519 public trust key in `include/ota_config.h`.
 - The matching private signing key must remain offline and outside the repository.
 - No signed release has been created, published, downloaded, or installed.
-- Physical OTA installation, reboot verification, rollback, and failure-recovery tests remain outstanding.
+- The computer exposes a CP210x USB serial port at COM3, but its connection to
+  the target ESP32 has not been confirmed. No firmware was flashed.
+- Physical OTA release discovery, download, installation, reboot verification, rollback, and failure-recovery tests remain outstanding.
 - OTA is not required for normal dashboard notice delivery or Wi-Fi configuration. USB firmware upload can continue to be used.
 
 ## 4. Security and operational notes
@@ -62,22 +73,22 @@ The following automated results were recorded in the earlier software audit. The
 - Keep `include/secrets.h`, `.env` files, and any OTA private signing key out of Git.
 - Use a unique, non-default `BOARD_AP_PASSWORD` for the ESP32 setup access point.
 - Wi-Fi credentials are stored in ESP32 Preferences/NVS and are not application-encrypted.
-- Dashboard sessions and backend operation state are held in memory; backend restarts can invalidate sessions or interrupt an in-progress Wi-Fi operation.
+- Dashboard sessions are stored as hashed session-token records in a configured persistent file; production deployment requires a Render persistent disk at the configured path. Device connections and operation state remain process-local, so run one backend instance.
 - The dashboard-to-device notice acknowledgment confirms the firmware's display routine was invoked; the physical LCD result must still be visually checked.
 - Keep the setup access point available as a recovery path when changing Wi-Fi networks.
 
 ## 5. Remaining work
 
-1. Update the separate `HARDWARE_TEST_CHECKLIST.md` to match these owner-reported physical results.
+1. Complete the physical steps in `HARDWARE_TEST_CHECKLIST.md`, including router outage/recovery and OTA check/install/reinstall/downgrade cases.
 2. Test incorrect Wi-Fi passwords, unavailable networks, timeout handling, and rollback to previously saved credentials.
 3. Verify LCD behavior for exact 16-character messages, 200-character messages, over-limit rejection, and a complete scrolling cycle.
-4. Configure the Ed25519 public key and perform OTA tests only when ready to manage signing keys and publish a test release.
-5. Review the six moderate npm advisories and plan safe dependency updates separately.
+4. Configure the Render persistent disk and deploy the backend/dashboard changes before testing browser sessions in production.
+5. Review the six previously reported moderate npm advisories separately.
 
 ## 6. Overall result
 
 The owner has successfully tested the main Smart Notice Board workflows on the physical ESP32: Wi-Fi provisioning through the local setup page and dashboard, network switching, Forget Wi-Fi, recovery access point availability, Render WebSocket reconnection, device authentication, notice delivery to the LCD, and automatic reconnection after a power cycle.
 
 **Main project functionality: WORKING (owner-reported physical tests).**  
-**Signed OTA: DISABLED / NOT TESTED.**  
+**Signed OTA: IMPLEMENTED; PHYSICAL TESTS NOT RUN.**
 **Additional negative-path and edge-case tests: STILL REQUIRED.**

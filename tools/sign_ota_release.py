@@ -22,6 +22,11 @@ def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--firmware", required=True, type=Path)
     parser.add_argument("--version", required=True)
+    parser.add_argument(
+        "--tag",
+        required=True,
+        help="Exact GitHub release tag, including its v/V prefix.",
+    )
     parser.add_argument("--private-key", required=True, type=Path)
     parser.add_argument(
         "--output",
@@ -51,6 +56,11 @@ def _validate_version(version):
         version,
     ):
         raise ValueError("--version must be a numeric major.minor.patch version.")
+
+
+def _validate_tag(tag, version):
+    if tag not in (f"v{version}", f"V{version}"):
+        raise ValueError("--tag must be the exact v/V-prefixed --version.")
 
 
 def _resolve_firmware(path):
@@ -114,8 +124,9 @@ def _read_firmware(firmware):
     return firmware_bytes
 
 
-def sign_release(firmware_path, version, private_key_path, output_path):
+def sign_release(firmware_path, version, private_key_path, output_path, tag):
     _validate_version(version)
+    _validate_tag(tag, version)
     firmware = _resolve_firmware(Path(firmware_path))
     private_key = _resolve_private_key(Path(private_key_path))
     output = _resolve_output(Path(output_path))
@@ -124,7 +135,7 @@ def sign_release(firmware_path, version, private_key_path, output_path):
     sha256 = hashlib.sha256(firmware_bytes).hexdigest()
     firmware_url = (
         f"https://github.com/{REPOSITORY}/releases/download/"
-        f"V{version}/firmware.bin"
+        f"{tag}/firmware.bin"
     )
     signed_content = build_signed_message(
         version,
@@ -206,6 +217,7 @@ def main(argv=None):
             args.version,
             args.private_key,
             args.output,
+            args.tag,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error

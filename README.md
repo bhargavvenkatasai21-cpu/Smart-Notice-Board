@@ -52,9 +52,9 @@ Ed25519 signature, version, image size, SHA-256 digest, and ESP32 image before
 activating the OTA slot. The backend reports an update as verified only after
 the device reboots and reports the expected version.
 
-OTA is intentionally disabled until the owner embeds their own Ed25519 public
-key in `include/ota_config.h`. No private key is in this repository; keep it
-offline and outside the repository. See [OTA_RELEASES.md](./OTA_RELEASES.md)
+The firmware contains an Ed25519 public trust key; the matching private key is
+not in this repository and must remain offline. Firmware updates fail closed
+if signature or image verification fails. See [OTA_RELEASES.md](./OTA_RELEASES.md)
 for the release process and [SECURITY.md](./SECURITY.md) for limitations.
 Application version checks do not provide Secure Boot, eFuse anti-rollback,
 or hardware-root-of-trust protection.
@@ -92,6 +92,9 @@ Render service settings:
   is never included in the frontend bundle.
 - `DASHBOARD_ORIGIN`: exact dashboard origin(s), comma-separated (include the
   deployed Render Static Site origin and any local development origin).
+- `DASHBOARD_SESSION_STORE_PATH`: local session file path for development;
+  on Render, use `/var/data/dashboard-sessions.json` on an attached persistent
+  disk.
 - `PORT`: optional; Render assigns this automatically.
 - `NOTICE_ACK_TIMEOUT_MS`: optional acknowledgment timeout; defaults to 10000.
 - `WIFI_CONFIGURATION_TIMEOUT_MS`: optional remote network configuration
@@ -100,23 +103,27 @@ Render service settings:
   defaults to 10000.
 - `FIRMWARE_UPDATE_TIMEOUT_MS`: optional OTA completion timeout; defaults to
   300000.
+- `FIRMWARE_CHECK_TIMEOUT_MS`: optional release-check timeout; defaults to
+  30000.
 
 Keep the access code and device token in untracked backend environment
 settings. Do not place credentials in a `VITE_*` variable: Vite embeds those
 values in publicly downloadable JavaScript. The dashboard exchanges the code
-for an opaque server-side session. Sessions expire after 12 hours by default
-or 30 days when “Remember me” is selected; logout revokes the current session.
-Remember me stores only the session token in `localStorage`, not the access
-code. JavaScript running on the dashboard origin can read local storage, so
-avoid shared devices and protect the site against cross-site scripting.
+for an opaque session in an HttpOnly cookie. The browser sends it automatically
+on refresh and in new tabs; frontend JavaScript cannot read the token. Sessions
+expire after 12 hours by default or 30 days when “Remember me” is selected;
+logout revokes the current session. Production must use a persistent Render
+disk and set `DASHBOARD_SESSION_STORE_PATH`; see [DEPLOYMENT.md](./DEPLOYMENT.md).
+The backend must remain a single instance because device connections and
+operations are process-local.
 
 The configured access code is short and guessable. Backend validation keeps
 it out of the frontend bundle, but does not make the code itself strong; use
 this shared code only for a trusted/demo deployment. For internet-facing or
 multi-user access, use a long random code or individual authentication.
-Sessions are held in backend memory and are invalidated when the backend
-restarts or is redeployed; this in-memory session store is not shared across
-multiple backend instances.
+The session file persists hashed session tokens and expiration metadata across
+backend restarts. It is not a distributed session store and must not be shared
+read-write by multiple service instances.
 
 ## Run locally
 

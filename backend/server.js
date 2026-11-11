@@ -3,7 +3,9 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const crypto = require("crypto");
+const path = require("node:path");
 const WebSocket = require("ws");
+const { createSessionStore } = require("./sessionStore");
 require("dotenv").config();
 
 const app = express();
@@ -23,11 +25,14 @@ const WIFI_FORGET_TIMEOUT_MS =
     Number(process.env.WIFI_FORGET_TIMEOUT_MS) || 10000;
 const FIRMWARE_UPDATE_TIMEOUT_MS =
     Number(process.env.FIRMWARE_UPDATE_TIMEOUT_MS) || 5 * 60 * 1000;
+const FIRMWARE_CHECK_TIMEOUT_MS =
+    Number(process.env.FIRMWARE_CHECK_TIMEOUT_MS) || 30000;
 const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 10;
 const LOGIN_RATE_LIMIT_MAX_CLIENTS = 10000;
 const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const REMEMBERED_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const DASHBOARD_SESSION_COOKIE = "snb_dashboard_session";
 const DASHBOARD_ORIGINS = (process.env.DASHBOARD_ORIGIN || "http://localhost:5173")
     .split(",")
     .map((origin) => origin.trim())
@@ -36,6 +41,17 @@ const DASHBOARD_ORIGINS = (process.env.DASHBOARD_ORIGIN || "http://localhost:517
 if (!DEVICE_TOKEN || !DASHBOARD_ACCESS_CODE) {
     throw new Error("Missing ESP32_DEVICE_TOKEN or DASHBOARD_ACCESS_CODE in .env");
 }
+
+if (process.env.NODE_ENV === "production" && !process.env.DASHBOARD_SESSION_STORE_PATH) {
+    throw new Error(
+        "DASHBOARD_SESSION_STORE_PATH must point to a persistent Render disk location."
+    );
+}
+
+const dashboardSessions = createSessionStore(
+    process.env.DASHBOARD_SESSION_STORE_PATH ||
+    path.join(__dirname, "data", "dashboard-sessions.json")
+);
 
 app.use((req, res, next) => {
     res.set({
@@ -58,10 +74,26 @@ app.use((req, res, next) => {
 app.use(cors({
     origin: DASHBOARD_ORIGINS,
     methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type", "Authorization"]
+    allowedHeaders: ["Content-Type"],
+    credentials: true
 }));
 
 app.use(express.json({ limit: "10kb" }));
+
+app.use((req, res, next) => {
+    const origin = req.get("Origin");
+    if (
+        req.method === "POST" &&
+        origin &&
+        !DASHBOARD_ORIGINS.includes(origin)
+    ) {
+        return res.status(403).json({
+            success: false,
+            message: "This origin is not allowed to perform dashboard actions."
+        });
+    }
+    next();
+});
 
 // Compare tokens safely
 function verifyToken(provided, expected) {
@@ -74,7 +106,6 @@ function verifyToken(provided, expected) {
         crypto.timingSafeEqual(a, b);
 }
 
-const dashboardSessions = new Map();
 const loginAttempts = new Map();
 
 function isLoginRateLimited(clientAddress, now = Date.now()) {
@@ -116,36 +147,71 @@ function hashSessionToken(token) {
     return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+function readDashboardSessionCookie(req) {
+    const cookieHeader = req.headers.cookie || "";
+    const cookie = cookieHeader
+        .split(";")
+        .map((entry) => entry.trim())
+        .find((entry) => entry.startsWith(`${DASHBOARD_SESSION_COOKIE}=`));
+    const token = cookie?.slice(DASHBOARD_SESSION_COOKIE.length + 1) || "";
+    return /^[a-f0-9]{64}$/.test(token) ? token : "";
+}
+
+function setDashboardSessionCookie(req, res, sessionToken, ttlMs) {
+    const secure = req.secure;
+    res.setHeader(
+        "Set-Cookie",
+        `${DASHBOARD_SESSION_COOKIE}=${sessionToken}; Path=/; HttpOnly; SameSite=${secure ? "None" : "Lax"}; Max-Age=${Math.floor(ttlMs / 1000)}${secure ? "; Secure" : ""}`
+    );
+}
+
+function clearDashboardSessionCookie(req, res) {
+    const secure = req.secure;
+    res.setHeader(
+        "Set-Cookie",
+        `${DASHBOARD_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=${secure ? "None" : "Lax"}; Max-Age=0${secure ? "; Secure" : ""}`
+    );
+}
+
 function createDashboardSession(rememberMe) {
     const sessionToken = crypto.randomBytes(32).toString("hex");
     const now = Date.now();
-    for (const [sessionKey, sessionExpiry] of dashboardSessions) {
-        if (sessionExpiry <= now) dashboardSessions.delete(sessionKey);
-    }
+    dashboardSessions.pruneExpired(now);
     const expiresAt = now +
         (rememberMe ? REMEMBERED_SESSION_TTL_MS : DASHBOARD_SESSION_TTL_MS);
     dashboardSessions.set(hashSessionToken(sessionToken), expiresAt);
-    return { sessionToken, expiresAt: new Date(expiresAt).toISOString() };
+    return {
+        sessionToken,
+        expiresAt,
+        ttlMs: rememberMe ? REMEMBERED_SESSION_TTL_MS : DASHBOARD_SESSION_TTL_MS
+    };
 }
 
 // Dashboard authentication
 function authenticateDashboard(req, res, next) {
     const authorization = req.headers.authorization || "";
-    const sessionToken = authorization.startsWith("Bearer ")
+    const legacyBearerToken = !req.get("Origin") &&
+        authorization.startsWith("Bearer ")
         ? authorization.slice(7)
         : "";
+    const sessionToken = legacyBearerToken || readDashboardSessionCookie(req);
     const sessionKey = sessionToken ? hashSessionToken(sessionToken) : "";
     const expiresAt = dashboardSessions.get(sessionKey);
 
     if (!expiresAt || expiresAt <= Date.now()) {
         if (sessionKey) dashboardSessions.delete(sessionKey);
+        if (sessionToken) clearDashboardSessionCookie(req, res);
         return res.status(401).json({
             success: false,
-            message: "Dashboard session is invalid or expired."
+            code: sessionToken ? "session_invalid" : "session_missing",
+            message: sessionToken
+                ? "Dashboard session is invalid or expired."
+                : "Dashboard sign-in is required."
         });
     }
 
     req.dashboardSessionKey = sessionKey;
+    req.dashboardSessionExpiresAt = expiresAt;
     next();
 }
 
@@ -181,12 +247,28 @@ app.post("/api/auth/login", (req, res) => {
 
     loginAttempts.delete(clientAddress);
     const session = createDashboardSession(req.body?.rememberMe === true);
-    return res.json({ success: true, ...session });
+    setDashboardSessionCookie(req, res, session.sessionToken, session.ttlMs);
+    const response = {
+        success: true,
+        expiresAt: new Date(session.expiresAt).toISOString()
+    };
+    if (!req.get("Origin")) {
+        response.sessionToken = session.sessionToken;
+    }
+    return res.json(response);
 });
 
 app.post("/api/auth/logout", authenticateDashboard, (req, res) => {
     dashboardSessions.delete(req.dashboardSessionKey);
+    clearDashboardSessionCookie(req, res);
     return res.json({ success: true });
+});
+
+app.get("/api/auth/session", authenticateDashboard, (req, res) => {
+    return res.json({
+        success: true,
+        expiresAt: new Date(req.dashboardSessionExpiresAt).toISOString()
+    });
 });
 
 // Health check
@@ -230,6 +312,8 @@ const heartbeatInterval = setInterval(() => {
     connectedDevice.isAlive = false;
     connectedDevice.ping();
 }, 5000);
+heartbeatInterval.unref();
+server.on("close", () => clearInterval(heartbeatInterval));
 
 let connectedDevice = null;
 let latestNotice = null;
@@ -444,7 +528,7 @@ function finishFirmwareUpdate(operation, state, message, version = operation.ver
     operation.message = message;
     operation.version = version || "";
     operation.updatedAt = new Date().toISOString();
-    if (["verified", "up_to_date", "failed", "timed_out"].includes(state)) {
+    if (["verified", "available", "up_to_date", "failed", "timed_out"].includes(state)) {
         clearTimeout(operation.timeout);
         operation.expiresAt = Date.now() + WIFI_CONFIGURATION_RETENTION_MS;
         if (activeFirmwareUpdateId === operation.id) {
@@ -456,6 +540,7 @@ function finishFirmwareUpdate(operation, state, message, version = operation.ver
 function updateFirmwareUpdateFromDevice(ws, data) {
     const allowedStates = [
         "checking",
+        "available",
         "downloading",
         "verifying",
         "rebooting",
@@ -499,10 +584,24 @@ function updateFirmwareUpdateFromDevice(ws, data) {
         );
         return;
     }
+    if (data.state === "available") {
+        if (operation.kind !== "check" || operation.state !== "checking" || !data.version) {
+            return;
+        }
+        finishFirmwareUpdate(
+            operation,
+            "available",
+            "A newer signed stable firmware release is available.",
+            data.version
+        );
+        return;
+    }
 
     const transitions = {
         command_sent: ["checking"],
-        checking: ["downloading", "rebooting"],
+        checking: operation.kind === "check"
+            ? []
+            : ["downloading", "rebooting"],
         downloading: ["verifying"],
         verifying: ["rebooting"]
     };
@@ -845,7 +944,7 @@ app.post(
                 delivered: true,
                 requestId,
                 ...noticeRecord,
-                message: "ESP32 acknowledged the notice command. You can see the physical LCD output for verification."
+                message: "ESP32 acknowledged the notice command. You can see the physical LCD output to verify."
             });
         } catch (error) {
             console.error("Notice delivery failed:", error.message);
@@ -1115,89 +1214,121 @@ app.get(
     }
 );
 
+function startFirmwareOperation(kind, allowReinstall, res) {
+    cleanWifiConfigurationOperations();
+    cleanWifiForgetOperations();
+    cleanFirmwareUpdateOperations();
+
+    if (
+        !connectedDevice ||
+        connectedDevice.readyState !== WebSocket.OPEN ||
+        !connectedDevice.authenticated
+    ) {
+        return res.status(503).json({
+            success: false,
+            message: "ESP32 is not connected to the backend."
+        });
+    }
+
+    const activeConfiguration = wifiConfigurationOperations.get(
+        activeWifiConfigurationId
+    );
+    const activeForget = wifiForgetOperations.get(activeWifiForgetId);
+    if (
+        (activeConfiguration && !activeConfiguration.expiresAt) ||
+        (activeForget && !activeForget.expiresAt) ||
+        activeFirmwareUpdateId
+    ) {
+        return res.status(409).json({
+            success: false,
+            message: "Another device operation is already in progress."
+        });
+    }
+
+    const requestId = crypto.randomUUID();
+    const operation = {
+        id: requestId,
+        kind,
+        allowReinstall,
+        state: "command_sent",
+        message: kind === "check"
+            ? "Firmware release check sent to ESP32."
+            : "Firmware installation request sent to ESP32.",
+        version: "",
+        device: connectedDevice,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        expiresAt: null,
+        timeout: null
+    };
+    operation.timeout = setTimeout(() => {
+        finishFirmwareUpdate(
+            operation,
+            "timed_out",
+            kind === "check"
+                ? "ESP32 did not complete the stable release check."
+                : "ESP32 did not confirm firmware installation and reconnection."
+        );
+    }, kind === "check" ? FIRMWARE_CHECK_TIMEOUT_MS : FIRMWARE_UPDATE_TIMEOUT_MS);
+    firmwareUpdateOperations.set(requestId, operation);
+    activeFirmwareUpdateId = requestId;
+
+    const command = {
+        type: kind === "check" ? "FIRMWARE_CHECK" : "FIRMWARE_UPDATE",
+        requestId
+    };
+    if (kind === "update") command.allowReinstall = allowReinstall;
+
+    try {
+        connectedDevice.send(JSON.stringify(command), (error) => {
+            if (error) {
+                finishFirmwareUpdate(
+                    operation,
+                    "failed",
+                    "The firmware operation command could not be sent to the ESP32."
+                );
+            }
+        });
+    } catch {
+        finishFirmwareUpdate(
+            operation,
+            "failed",
+            "The firmware operation command could not be sent to the ESP32."
+        );
+    }
+
+    return res.status(202).json({
+        success: true,
+        requestId,
+        state: operation.state,
+        message: operation.message
+    });
+}
+
+app.post(
+    "/api/device/firmware-check",
+    authenticateDashboard,
+    (_req, res) => startFirmwareOperation("check", false, res)
+);
+
 app.post(
     "/api/device/firmware-update",
     authenticateDashboard,
     (req, res) => {
-        cleanWifiConfigurationOperations();
-        cleanWifiForgetOperations();
-        cleanFirmwareUpdateOperations();
-
         if (
-            !connectedDevice ||
-            connectedDevice.readyState !== WebSocket.OPEN ||
-            !connectedDevice.authenticated
+            req.body?.allowReinstall !== undefined &&
+            typeof req.body.allowReinstall !== "boolean"
         ) {
-            return res.status(503).json({
+            return res.status(400).json({
                 success: false,
-                message: "ESP32 is not connected to the backend."
+                message: "allowReinstall must be a boolean."
             });
         }
-
-        const activeConfiguration = wifiConfigurationOperations.get(
-            activeWifiConfigurationId
+        return startFirmwareOperation(
+            "update",
+            req.body?.allowReinstall === true,
+            res
         );
-        const activeForget = wifiForgetOperations.get(activeWifiForgetId);
-        if (
-            (activeConfiguration && !activeConfiguration.expiresAt) ||
-            (activeForget && !activeForget.expiresAt) ||
-            activeFirmwareUpdateId
-        ) {
-            return res.status(409).json({
-                success: false,
-                message: "Another device operation is already in progress."
-            });
-        }
-
-        const requestId = crypto.randomUUID();
-        const operation = {
-            id: requestId,
-            state: "command_sent",
-            message: "Firmware update request sent to ESP32.",
-            version: "",
-            device: connectedDevice,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            expiresAt: null,
-            timeout: null
-        };
-        operation.timeout = setTimeout(() => {
-            finishFirmwareUpdate(
-                operation,
-                "timed_out",
-                "ESP32 did not confirm firmware installation and reconnection."
-            );
-        }, FIRMWARE_UPDATE_TIMEOUT_MS);
-        firmwareUpdateOperations.set(requestId, operation);
-        activeFirmwareUpdateId = requestId;
-
-        try {
-            connectedDevice.send(JSON.stringify({
-                type: "FIRMWARE_UPDATE",
-                requestId
-            }), (error) => {
-                if (error) {
-                    finishFirmwareUpdate(
-                        operation,
-                        "failed",
-                        "The firmware update command could not be sent to the ESP32."
-                    );
-                }
-            });
-        } catch {
-            finishFirmwareUpdate(
-                operation,
-                "failed",
-                "The firmware update command could not be sent to the ESP32."
-            );
-        }
-
-        return res.status(202).json({
-            success: true,
-            requestId,
-            state: operation.state,
-            message: operation.message
-        });
     }
 );
 
