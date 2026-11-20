@@ -430,6 +430,14 @@
   color: #315b9d;
 }
 
+.firmware-progress {
+  display: block;
+  width: 100%;
+  height: 8px;
+  margin: -8px 0 16px;
+  accent-color: #315b9d;
+}
+
 .feedback.warning {
   border-color: #f0dfb8;
   background: #fff9eb;

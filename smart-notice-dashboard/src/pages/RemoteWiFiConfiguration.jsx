@@ -20,7 +20,7 @@ const FIRMWARE_TERMINAL_STATES = new Set([
 ]);
 const POLL_INTERVAL_MS = 1500;
 const MAX_POLL_ATTEMPTS = 90;
-const MAX_FIRMWARE_POLL_ATTEMPTS = 190;
+const MAX_FIRMWARE_POLL_ATTEMPTS = 620;
 
 const OPERATION_LABELS = {
   command_sent: "Sending configuration to the ESP32…",
@@ -490,24 +490,44 @@ function RemoteWiFiConfiguration({
               </div>
             )}
             {firmwareOperation && (
-              <p
-                className={`feedback ${
-                  ["verified", "up_to_date"].includes(firmwareOperation.state)
-                    ? "success"
-                    : firmwareOperation.state === "failed" ||
-                        firmwareOperation.state === "timed_out"
-                      ? "error"
-                      : "info"
-                }`}
-                role="status"
-                aria-live="polite"
-              >
-                {FIRMWARE_OPERATION_LABELS[firmwareOperation.state] ||
-                  "Checking firmware update status…"}
-                {firmwareOperation.version
-                  ? ` (v${firmwareOperation.version})`
-                  : ""}
-              </p>
+              <>
+                <p
+                  className={`feedback ${
+                    ["verified", "up_to_date"].includes(firmwareOperation.state)
+                      ? "success"
+                      : firmwareOperation.state === "failed" ||
+                          firmwareOperation.state === "timed_out"
+                        ? "error"
+                        : "info"
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {FIRMWARE_OPERATION_LABELS[firmwareOperation.state] ||
+                    "Checking firmware update status…"}
+                  {firmwareOperation.state === "downloading" &&
+                  Number.isInteger(firmwareOperation.progress)
+                    ? ` ${firmwareOperation.progress}%`
+                    : ""}
+                  {firmwareOperation.version
+                    ? ` (v${firmwareOperation.version})`
+                    : ""}
+                </p>
+                {["checking", "downloading", "verifying", "rebooting"].includes(
+                  firmwareOperation.state,
+                ) && (
+                  <progress
+                    aria-label="Firmware update progress"
+                    className="firmware-progress"
+                    max="100"
+                    value={
+                      firmwareOperation.state === "downloading"
+                        ? firmwareOperation.progress ?? 0
+                        : undefined
+                    }
+                  />
+                )}
+              </>
             )}
             {firmwareError && (
               <p className="feedback error" role="alert">{firmwareError}</p>

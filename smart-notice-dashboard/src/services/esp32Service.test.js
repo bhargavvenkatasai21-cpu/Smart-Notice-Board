@@ -434,6 +434,20 @@ describe("status and notice API", () => {
     await expect(
       getFirmwareUpdate("firmware-123"),
     ).rejects.toThrow(/invalid firmware update status/);
+
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        success: true,
+        operation: {
+          requestId: "firmware-123",
+          state: "downloading",
+          progress: 101,
+        },
+      }),
+    );
+    await expect(
+      getFirmwareUpdate("firmware-123"),
+    ).rejects.toThrow(/invalid firmware update status/);
   });
 
   it("exchanges the access code for a backend session", async () => {

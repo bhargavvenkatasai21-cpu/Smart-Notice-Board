@@ -270,4 +270,58 @@ describe("remote ESP32 Wi-Fi configuration", () => {
       }),
     ).toBeInTheDocument();
   });
+
+  it("shows download progress while firmware is being installed", async () => {
+    const user = userEvent.setup();
+    startFirmwareCheck.mockResolvedValue({
+      requestId: "check-progress",
+      state: "command_sent",
+    });
+    startFirmwareUpdate.mockResolvedValue({
+      requestId: "install-progress",
+      state: "command_sent",
+    });
+    getFirmwareUpdate
+      .mockResolvedValueOnce({
+        requestId: "check-progress",
+        state: "up_to_date",
+        version: "1.0.3",
+      })
+      .mockResolvedValueOnce({
+        requestId: "install-progress",
+        state: "downloading",
+        progress: 45,
+      })
+      .mockResolvedValueOnce({
+        requestId: "install-progress",
+        state: "timed_out",
+      });
+
+    render(
+      <RemoteWiFiConfiguration
+        deviceConnected
+        onConfigured={vi.fn().mockResolvedValue(undefined)}
+        wifiStatus={{ connected: true, firmwareVersion: "1.0.3" }}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Check for signed update" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Reinstall current firmware" }, {
+        timeout: 3000,
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Confirm reinstall" }));
+
+    expect(
+      await screen.findByText(
+        /Downloading firmware over verified HTTPS… 45%/,
+        {},
+        { timeout: 3000 },
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("progressbar", { name: "Firmware update progress" }),
+    ).toHaveAttribute("value", "45");
+  });
 });

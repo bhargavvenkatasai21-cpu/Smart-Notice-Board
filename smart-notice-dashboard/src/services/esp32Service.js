@@ -344,6 +344,10 @@ export async function getFirmwareUpdate(requestId) {
   if (
     result?.success !== true ||
     operation?.requestId !== requestId ||
+    (operation?.progress !== undefined &&
+      (!Number.isInteger(operation.progress) ||
+        operation.progress < 0 ||
+        operation.progress > 100)) ||
     ![
       "command_sent",
       "checking",
