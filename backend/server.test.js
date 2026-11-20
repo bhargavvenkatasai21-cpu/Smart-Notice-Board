@@ -58,6 +58,19 @@ async function connectDevice(options = {}) {
     socket.send(JSON.stringify({ type: "AUTH", token: DEVICE_TOKEN }));
     await authenticated;
     deviceSocket = socket;
+    if (options.autoHeartbeat !== false) {
+        const sendHeartbeat = () => {
+            if (socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: "DEVICE_HEARTBEAT" }));
+            }
+        };
+        sendHeartbeat();
+        if (options.autoHeartbeat !== "once") {
+            const heartbeatTimer = setInterval(sendHeartbeat, 1000);
+            heartbeatTimer.unref();
+            socket.once("close", () => clearInterval(heartbeatTimer));
+        }
+    }
     return socket;
 }
 
@@ -248,8 +261,8 @@ test("status accurately reports a disconnected device", async () => {
     assert.equal(status.latestNotice, null);
 });
 
-test("heartbeat marks a silent ESP32 offline and accepts a reconnect", async () => {
-    const silentSocket = await connectDevice({ autoPong: false });
+test("application heartbeat marks a silent ESP32 offline and accepts a reconnect", async () => {
+    const silentSocket = await connectDevice({ autoHeartbeat: "once" });
     const statusUrl = `${baseUrl}/api/device/status`;
     const readStatus = async () => {
         const response = await fetch(statusUrl, {
@@ -259,19 +272,39 @@ test("heartbeat marks a silent ESP32 offline and accepts a reconnect", async () 
         return response.json();
     };
 
-    assert.equal((await readStatus()).connected, true);
+    let status = await readStatus();
+    const onlineDeadline = Date.now() + 1000;
+    while (!status.connected && Date.now() < onlineDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        status = await readStatus();
+    }
+    assert.equal(status.connected, true);
+    silentSocket.send(JSON.stringify({
+        type: "DEVICE_STATUS",
+        connected: true,
+        ssid: "Office",
+        ip: "192.168.10.20",
+        rssi: -58,
+        firmwareVersion: "1.0.3"
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
 
     const offlineDeadline = Date.now() + 12000;
-    let status;
     do {
         await new Promise((resolve) => setTimeout(resolve, 200));
         status = await readStatus();
     } while (status.connected && Date.now() < offlineDeadline);
 
-    assert.equal(status.connected, false, "heartbeat should detect the silent device within 12 seconds");
+    assert.equal(status.connected, false, "application heartbeat should detect a silent device within 12 seconds");
     assert.equal(status.websocketConnected, false);
+    assert.equal(status.wifi.connected, false, "stale Wi-Fi details should not appear connected while the device heartbeat is stale");
+    assert.equal(status.wifi.ssid, "");
+    assert.equal(status.wifi.ip, "");
     assert.ok(status.lastSeenAt, "last communication remains available as historical data");
-    assert.equal(silentSocket.readyState, WebSocket.CLOSED);
+    assert.equal(silentSocket.readyState, WebSocket.OPEN, "the control-frame connection can remain open after application heartbeats stop");
+    const healthResponse = await fetch(`${baseUrl}/api/health`);
+    const health = await healthResponse.json();
+    assert.equal(health.websocketConnected, false);
 
     const reconnectedSocket = await connectDevice();
     status = await readStatus();

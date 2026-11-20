@@ -43,6 +43,7 @@ namespace
     constexpr unsigned long kInitialFrameHoldMs = 5000;
     constexpr unsigned long kScrollIntervalMs = 350;
     constexpr unsigned long kDeviceStatusIntervalMs = 30000;
+    constexpr unsigned long kDeviceHeartbeatIntervalMs = 5000;
     constexpr unsigned long kForgetDisconnectDelayMs = 250;
     constexpr unsigned long kTimeSyncRetryIntervalMs = 30000;
     constexpr time_t kMinimumValidTime = 1704067200;
@@ -73,6 +74,7 @@ namespace
     unsigned long lastReconnectAttemptAt = 0;
     unsigned long reconnectDelayMs = kReconnectInitialDelayMs;
     unsigned long lastDeviceStatusAt = 0;
+    unsigned long lastDeviceHeartbeatAt = 0;
     unsigned long lastTimeSyncRequestAt = 0;
     unsigned long wifiForgetDisconnectStartedAt = 0;
     bool reconnectBackoffActive = false;
@@ -170,7 +172,13 @@ namespace
         frame[kLcdColumns] = '\0';
 
         lcd.setCursor(0, 0);
-        for (size_t i = 0; i < kLcdColumns; ++i)
+        for (size_t i = 0; i < kLcdColumns / 2; ++i)
+        {
+            lcd.write(static_cast<uint8_t>(frame[i]));
+        }
+
+        lcd.setCursor(0, 1);
+        for (size_t i = kLcdColumns / 2; i < kLcdColumns; ++i)
         {
             lcd.write(static_cast<uint8_t>(frame[i]));
         }
@@ -575,6 +583,21 @@ namespace
         lastDeviceStatusAt = millis();
     }
 
+    void sendDeviceHeartbeat()
+    {
+        if (!webSocketAuthenticated)
+        {
+            return;
+        }
+
+        JsonDocument document;
+        document["type"] = "DEVICE_HEARTBEAT";
+        String message;
+        serializeJson(document, message);
+        webSocket.sendTXT(message);
+        lastDeviceHeartbeatAt = millis();
+    }
+
     void handleRemoteWifiForget(JsonDocument &document)
     {
         const char *requestId = document["requestId"];
@@ -963,6 +986,7 @@ namespace
             if (strcmp(messageType, "CONNECTION") == 0)
             {
                 webSocketAuthenticated = true;
+                lastDeviceHeartbeatAt = millis();
                 Serial.println("ESP32 authenticated successfully");
                 sendDeviceStatus();
 
@@ -1629,7 +1653,8 @@ void setup()
             "WARNING: setup AP uses its default password; set BOARD_AP_PASSWORD in include/secrets.h");
     }
 
-    lcd.begin(16, 1);
+    // The 16x1 module maps its visible halves to two 8-character controller rows.
+    lcd.begin(8, 2);
     lcd.noAutoscroll();
     lcd.leftToRight();
     lcd.noCursor();
@@ -1690,6 +1715,13 @@ void loop()
     if (webSocketStarted)
     {
         webSocket.loop();
+    }
+
+    if (
+        webSocketAuthenticated &&
+        millis() - lastDeviceHeartbeatAt >= kDeviceHeartbeatIntervalMs)
+    {
+        sendDeviceHeartbeat();
     }
 
     processFirmwareUpdateEvents();

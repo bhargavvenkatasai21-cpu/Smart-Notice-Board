@@ -27,6 +27,7 @@ const FIRMWARE_UPDATE_TIMEOUT_MS =
     Number(process.env.FIRMWARE_UPDATE_TIMEOUT_MS) || 15 * 60 * 1000;
 const FIRMWARE_CHECK_TIMEOUT_MS =
     Number(process.env.FIRMWARE_CHECK_TIMEOUT_MS) || 30000;
+const DEVICE_HEARTBEAT_TIMEOUT_MS = 10000;
 const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 10;
 const LOGIN_RATE_LIMIT_MAX_CLIENTS = 10000;
@@ -280,13 +281,11 @@ app.get("/", (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
+    const websocketConnected = isDeviceConnected();
     res.json({
         status: "OK",
         service: "Smart Notice Board Backend",
-        websocketConnected: Boolean(
-            connectedDevice &&
-            connectedDevice.readyState === WebSocket.OPEN
-        )
+        websocketConnected
     });
 });
 
@@ -333,6 +332,24 @@ let deviceWifiStatus = {
     firmwareVersion: null,
     lastConnectedAt: null
 };
+
+function markDeviceCommunication(ws) {
+    if (connectedDevice !== ws) return;
+
+    ws.lastCommunicationAt = Date.now();
+    lastDeviceCommunicationAt = new Date(ws.lastCommunicationAt).toISOString();
+}
+
+function isDeviceConnected() {
+    return Boolean(
+        connectedDevice &&
+        connectedDevice.authenticated &&
+        connectedDevice.readyState === WebSocket.OPEN &&
+        Number.isFinite(connectedDevice.lastHeartbeatAt) &&
+        Date.now() - connectedDevice.lastHeartbeatAt <=
+            DEVICE_HEARTBEAT_TIMEOUT_MS
+    );
+}
 
 function isRequestId(value) {
     return typeof value === "string" &&
@@ -747,7 +764,7 @@ wss.on("connection", (ws) => {
 
             ws.authenticated = true;
             connectedDevice = ws;
-            lastDeviceCommunicationAt = new Date().toISOString();
+            markDeviceCommunication(ws);
 
             console.log("ESP32 authenticated and connected.");
 
@@ -764,10 +781,15 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        lastDeviceCommunicationAt = new Date().toISOString();
-        console.log("Message received from ESP32:", data.type || "unknown");
+        if (connectedDevice !== ws) return;
+        markDeviceCommunication(ws);
+        if (data.type !== "DEVICE_HEARTBEAT") {
+            console.log("Message received from ESP32:", data.type || "unknown");
+        }
 
-        if (data.type === "DEVICE_STATUS") {
+        if (data.type === "DEVICE_HEARTBEAT") {
+            ws.lastHeartbeatAt = Date.now();
+        } else if (data.type === "DEVICE_STATUS") {
             updateDeviceWifiStatus(data);
         } else if (data.type === "WIFI_CONFIG_STATUS") {
             updateWifiConfigurationFromDevice(ws, data);
@@ -798,17 +820,13 @@ wss.on("connection", (ws) => {
     });
 
     ws.on("ping", () => {
-        if (ws.authenticated && connectedDevice === ws) {
-            lastDeviceCommunicationAt = new Date().toISOString();
-        }
+        if (ws.authenticated) markDeviceCommunication(ws);
     });
 
     ws.on("pong", () => {
         ws.isAlive = true;
 
-        if (ws.authenticated && connectedDevice === ws) {
-            lastDeviceCommunicationAt = new Date().toISOString();
-        }
+        if (ws.authenticated) markDeviceCommunication(ws);
     });
 
     ws.on("close", () => {
@@ -898,8 +916,7 @@ app.post(
             });
         }
 
-        if (!connectedDevice ||
-            connectedDevice.readyState !== WebSocket.OPEN) {
+        if (!isDeviceConnected()) {
             return res.status(503).json({
                 success: false,
                 delivered: false,
@@ -1001,9 +1018,7 @@ app.post(
         }
 
         if (
-            !connectedDevice ||
-            connectedDevice.readyState !== WebSocket.OPEN ||
-            !connectedDevice.authenticated
+            !isDeviceConnected()
         ) {
             return res.status(503).json({
                 success: false,
@@ -1118,9 +1133,7 @@ app.post(
         cleanWifiConfigurationOperations();
         cleanWifiForgetOperations();
         if (
-            !connectedDevice ||
-            connectedDevice.readyState !== WebSocket.OPEN ||
-            !connectedDevice.authenticated
+            !isDeviceConnected()
         ) {
             return res.status(503).json({
                 success: false,
@@ -1228,9 +1241,7 @@ function startFirmwareOperation(kind, allowReinstall, res) {
     cleanFirmwareUpdateOperations();
 
     if (
-        !connectedDevice ||
-        connectedDevice.readyState !== WebSocket.OPEN ||
-        !connectedDevice.authenticated
+        !isDeviceConnected()
     ) {
         return res.status(503).json({
             success: false,
@@ -1373,17 +1384,20 @@ app.get(
     "/api/device/status",
     authenticateDashboard,
     (req, res) => {
+        const connected = isDeviceConnected();
         res.json({
-            connected: Boolean(
-                connectedDevice &&
-                connectedDevice.readyState === WebSocket.OPEN
-            ),
-            websocketConnected: Boolean(
-                connectedDevice &&
-                connectedDevice.readyState === WebSocket.OPEN
-            ),
+            connected,
+            websocketConnected: connected,
             lastSeenAt: lastDeviceCommunicationAt,
-            wifi: deviceWifiStatus,
+            wifi: connected
+                ? deviceWifiStatus
+                : {
+                    ...deviceWifiStatus,
+                    connected: false,
+                    ssid: "",
+                    ip: "",
+                    rssi: null
+                },
             latestNotice
         });
     }
