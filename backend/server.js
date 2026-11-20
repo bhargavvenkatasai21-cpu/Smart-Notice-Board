@@ -24,7 +24,7 @@ const WIFI_CONFIGURATION_RETENTION_MS = 10 * 60 * 1000;
 const WIFI_FORGET_TIMEOUT_MS =
     Number(process.env.WIFI_FORGET_TIMEOUT_MS) || 10000;
 const FIRMWARE_UPDATE_TIMEOUT_MS =
-    Number(process.env.FIRMWARE_UPDATE_TIMEOUT_MS) || 5 * 60 * 1000;
+    Number(process.env.FIRMWARE_UPDATE_TIMEOUT_MS) || 15 * 60 * 1000;
 const FIRMWARE_CHECK_TIMEOUT_MS =
     Number(process.env.FIRMWARE_CHECK_TIMEOUT_MS) || 30000;
 const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
@@ -518,6 +518,7 @@ function publicFirmwareUpdate(operation) {
         state: operation.state,
         message: operation.message,
         version: operation.version || "",
+        progress: operation.progress,
         createdAt: operation.createdAt,
         updatedAt: operation.updatedAt
     };
@@ -553,7 +554,11 @@ function updateFirmwareUpdateFromDevice(ws, data) {
         (data.version !== undefined &&
             (typeof data.version !== "string" || data.version.length > 32)) ||
         (data.message !== undefined &&
-            (typeof data.message !== "string" || data.message.length > 240))
+            (typeof data.message !== "string" || data.message.length > 240)) ||
+        (data.progress !== undefined &&
+            (!Number.isInteger(data.progress) ||
+                data.progress < 0 ||
+                data.progress > 100))
     ) {
         return;
     }
@@ -602,7 +607,7 @@ function updateFirmwareUpdateFromDevice(ws, data) {
         checking: operation.kind === "check"
             ? []
             : ["downloading", "rebooting"],
-        downloading: ["verifying"],
+        downloading: ["downloading", "verifying"],
         verifying: ["rebooting"]
     };
     if (!transitions[operation.state]?.includes(data.state)) {
@@ -620,6 +625,9 @@ function updateFirmwareUpdateFromDevice(ws, data) {
         rebooting: "Firmware installed; waiting for the ESP32 to reconnect."
     }[data.state];
     operation.updatedAt = new Date().toISOString();
+    if (data.state === "downloading" && data.progress !== undefined) {
+        operation.progress = data.progress;
+    }
     if (data.state === "rebooting") {
         operation.version = data.version;
     }
@@ -1255,6 +1263,7 @@ function startFirmwareOperation(kind, allowReinstall, res) {
             ? "Firmware release check sent to ESP32."
             : "Firmware installation request sent to ESP32.",
         version: "",
+        progress: 0,
         device: connectedDevice,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),

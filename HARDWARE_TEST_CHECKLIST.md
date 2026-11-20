@@ -79,7 +79,7 @@ These are pending unless the earlier owner-reported observations above explicitl
 5. [ ] Turn the router off; verify the ESP32 remains powered, AP/HTTP remain reachable, and reset reason/uptime do not change.
 6. [ ] Restore the router; verify saved-credential reconnection and WebSocket recovery without a reboot.
 7. [ ] Send a notice during normal connectivity and verify acknowledgement and the physical LCD.
-8. [ ] Verify 16×2 display behavior, scrolling, trailing blank frame, and restart position.
+8. [ ] Verify 16×1 display behavior, scrolling, trailing blank frame, and restart position.
 9. [ ] Use **Forget saved Wi-Fi** explicitly; verify credentials are erased while the setup AP remains available.
 10. [ ] Reboot and verify saved credentials reconnect when they have not been explicitly forgotten.
 11. [ ] Check the latest stable signed release; verify this check alone does not download or install firmware.

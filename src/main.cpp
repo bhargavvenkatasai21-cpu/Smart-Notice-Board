@@ -49,7 +49,6 @@ namespace
 
     constexpr size_t kMaxNoticeLength = 200;
     constexpr size_t kLcdColumns = 16;
-    constexpr size_t kFirstSegmentColumns = 8;
 
     // ESP32 pins: RS, E, DB4, DB5, DB6, DB7
     LiquidCrystal lcd(23, 22, 21, 19, 18, 17);
@@ -114,6 +113,7 @@ namespace
         char state[16];
         char version[32];
         char message[241];
+        int progress;
     };
 
     QueueHandle_t firmwareUpdateStatusQueue = nullptr;
@@ -160,9 +160,6 @@ namespace
         }
     }
 
-    // JHD161A is physically one row of 16 characters. Internally, its
-    // controller uses two 8-character DDRAM address sections. The LiquidCrystal
-    // library's row 0 and row 1 addresses select those two visible sections.
     void writeLcd16(const String &text)
     {
         char frame[kLcdColumns + 1];
@@ -173,13 +170,7 @@ namespace
         frame[kLcdColumns] = '\0';
 
         lcd.setCursor(0, 0);
-        for (size_t i = 0; i < kFirstSegmentColumns; ++i)
-        {
-            lcd.write(static_cast<uint8_t>(frame[i]));
-        }
-
-        lcd.setCursor(0, 1);
-        for (size_t i = kFirstSegmentColumns; i < kLcdColumns; ++i)
+        for (size_t i = 0; i < kLcdColumns; ++i)
         {
             lcd.write(static_cast<uint8_t>(frame[i]));
         }
@@ -379,7 +370,8 @@ namespace
         const String &requestId,
         const char *state,
         const String &version = "",
-        const String &messageText = "")
+        const String &messageText = "",
+        int progress = -1)
     {
         if (!webSocketAuthenticated || requestId.isEmpty())
         {
@@ -398,6 +390,10 @@ namespace
         {
             document["message"] = messageText;
         }
+        if (progress >= 0)
+        {
+            document["progress"] = progress;
+        }
 
         String message;
         serializeJson(document, message);
@@ -406,12 +402,14 @@ namespace
 
     void reportFirmwareUpdateStatus(
         const char *state,
-        const String &version)
+        const String &version,
+        int progress)
     {
         FirmwareUpdateEvent event{};
         event.type = FirmwareUpdateEventType::Status;
         strncpy(event.state, state, sizeof(event.state) - 1);
         version.toCharArray(event.version, sizeof(event.version));
+        event.progress = progress;
         xQueueSend(firmwareUpdateStatusQueue, &event, portMAX_DELAY);
     }
 
@@ -448,6 +446,7 @@ namespace
             event.type = FirmwareUpdateEventType::Status;
             strncpy(event.state, "failed", sizeof(event.state) - 1);
             failureMessage.toCharArray(event.message, sizeof(event.message));
+            event.progress = -1;
             xQueueSend(firmwareUpdateStatusQueue, &event, portMAX_DELAY);
         }
 
@@ -468,7 +467,8 @@ namespace
                     firmwareUpdateRequestId,
                     event.state,
                     event.version,
-                    event.message);
+                    event.message,
+                    event.progress);
             }
             else
             {
@@ -1629,7 +1629,7 @@ void setup()
             "WARNING: setup AP uses its default password; set BOARD_AP_PASSWORD in include/secrets.h");
     }
 
-    lcd.begin(16, 2);
+    lcd.begin(16, 1);
     lcd.noAutoscroll();
     lcd.leftToRight();
     lcd.noCursor();

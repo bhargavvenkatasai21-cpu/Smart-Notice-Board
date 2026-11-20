@@ -636,12 +636,17 @@ test("firmware update is authorized, tracked, and verified after device reconnec
     });
     assert.equal(duplicate.status, 409);
 
-    for (const state of ["checking", "downloading", "verifying", "rebooting"]) {
+    for (const update of [
+        { state: "checking" },
+        { state: "downloading", progress: 101 },
+        { state: "downloading", progress: 47 },
+        { state: "verifying" },
+        { state: "rebooting", version: "1.0.1" }
+    ]) {
         socket.send(JSON.stringify({
             type: "FIRMWARE_UPDATE_STATUS",
             requestId: command.requestId,
-            state,
-            ...(state === "rebooting" ? { version: "1.0.1" } : {})
+            ...update
         }));
     }
     socket.close();
@@ -667,6 +672,7 @@ test("firmware update is authorized, tracked, and verified after device reconnec
     assert.equal(statusResponse.status, 200);
     assert.equal(status.operation.state, "verified");
     assert.equal(status.operation.version, "1.0.1");
+    assert.equal(status.operation.progress, 47);
 
     const failedCommand = new Promise((resolve, reject) => {
         const timeout = setTimeout(

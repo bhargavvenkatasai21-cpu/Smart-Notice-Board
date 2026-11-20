@@ -556,7 +556,7 @@ namespace
             return false;
         }
 
-        reportStatus("downloading", version);
+        reportStatus("downloading", version, 0);
         mbedtls_sha256_context hashContext;
         mbedtls_sha256_init(&hashContext);
         if (mbedtls_sha256_starts(&hashContext, 0) != 0)
@@ -571,6 +571,7 @@ namespace
         uint8_t buffer[kDownloadBufferBytes];
         size_t received = 0;
         size_t nextProgressLog = kProgressLogIntervalBytes;
+        int lastReportedProgress = 0;
         bool downloadSucceeded = true;
         const char *downloadFailureReason = nullptr;
         const uint32_t downloadStartedAt = millis();
@@ -643,6 +644,13 @@ namespace
                         static_cast<unsigned int>(firmwareSize),
                         static_cast<unsigned long>(lastDataAt - downloadStartedAt));
                     nextProgressLog += kProgressLogIntervalBytes;
+                }
+                const int progress = static_cast<int>(
+                    (received * 100) / firmwareSize);
+                if (progress > lastReportedProgress)
+                {
+                    reportStatus("downloading", version, progress);
+                    lastReportedProgress = progress;
                 }
                 continue;
             }
@@ -759,7 +767,7 @@ namespace
             return false;
         }
 
-        reportStatus("verifying", version);
+        reportStatus("verifying", version, -1);
         if (!Update.end())
         {
             Serial.printf("[OTA] ERROR: Update.end failed: %s\n",
@@ -770,7 +778,7 @@ namespace
         }
 
         Serial.println("[OTA] Firmware image verified and written successfully.");
-        reportStatus("rebooting", version);
+        reportStatus("rebooting", version, -1);
         delay(300);
         ESP.restart();
         return true;
@@ -849,7 +857,7 @@ namespace firmware_update
             return false;
         }
 
-        reportStatus("checking", "");
+        reportStatus("checking", "", -1);
         String firmwareUrl;
         size_t firmwareSize = 0;
         unsigned char expectedHash[32] = {};
@@ -870,11 +878,11 @@ namespace firmware_update
 
         if (sameVersion)
         {
-            reportStatus("up_to_date", availableVersion);
+            reportStatus("up_to_date", availableVersion, -1);
         }
         else
         {
-            reportStatus("available", availableVersion);
+            reportStatus("available", availableVersion, -1);
         }
         return true;
     }
@@ -900,7 +908,7 @@ namespace firmware_update
             return false;
         }
 
-        reportStatus("checking", "");
+        reportStatus("checking", "", -1);
         String firmwareUrl;
         size_t firmwareSize = 0;
         unsigned char expectedHash[32] = {};
@@ -921,7 +929,7 @@ namespace firmware_update
                 failureMessage ==
                     "Same-version reinstall requires explicit confirmation.")
             {
-                reportStatus("up_to_date", updatedVersion);
+                reportStatus("up_to_date", updatedVersion, -1);
                 return true;
             }
             return false;

@@ -102,7 +102,7 @@ Render service settings:
 - `WIFI_FORGET_TIMEOUT_MS`: optional credential-deletion confirmation timeout;
   defaults to 10000.
 - `FIRMWARE_UPDATE_TIMEOUT_MS`: optional OTA completion timeout; defaults to
-  300000.
+  900000 (15 minutes) to allow the full firmware download and device reboot.
 - `FIRMWARE_CHECK_TIMEOUT_MS`: optional release-check timeout; defaults to
   30000.
 

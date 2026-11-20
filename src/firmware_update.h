@@ -4,7 +4,7 @@
 
 namespace firmware_update
 {
-    using StatusCallback = void (*)(const char *, const String &);
+    using StatusCallback = void (*)(const char *, const String &, int);
 
     bool checkForUpdate(
         const char *currentVersion,
